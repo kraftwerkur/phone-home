@@ -1,0 +1,8 @@
+node_modules/
+data/
+venv/
+*.pt
+.env
+hub/certs/
+__pycache__/
+*.pyc

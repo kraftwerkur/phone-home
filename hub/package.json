@@ -1,0 +1,16 @@
+{
+  "name": "phone-home-hub",
+  "version": "0.1.0",
+  "description": "Phone Home hub server",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0",
+    "sharp": "^0.33.0",
+    "uuid": "^11.0.0"
+  }
+}

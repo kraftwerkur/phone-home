@@ -1,0 +1,9 @@
+{
+  "name": "phone-home",
+  "version": "0.1.0",
+  "description": "Turn old iPhones into sensor nodes for a home sensor network",
+  "type": "module",
+  "scripts": {
+    "start": "node hub/server.js"
+  }
+}

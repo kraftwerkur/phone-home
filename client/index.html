@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Phone Home">
+<meta name="theme-color" content="#0a0a0a">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<title>Phone Home</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  -webkit-text-size-adjust: 100%;
+}
+.status-dot {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+.status-dot.connected { background: #4caf50; box-shadow: 0 0 10px #4caf50; }
+.status-dot.disconnected { background: #f44336; box-shadow: 0 0 10px #f44336; }
+.status-dot.connecting { background: #ff9800; box-shadow: 0 0 10px #ff9800; }
+
+h1 {
+  font-size: 2.5em;
+  font-weight: 300;
+  margin-bottom: 10px;
+  letter-spacing: 2px;
+}
+.node-name {
+  font-size: 1.4em;
+  color: #888;
+  margin-bottom: 30px;
+}
+.status-line {
+  font-size: 1.8em;
+  font-weight: 200;
+  margin-bottom: 20px;
+}
+.last-command {
+  font-size: 1em;
+  color: #666;
+  margin-bottom: 10px;
+}
+.battery {
+  font-size: 0.9em;
+  color: #555;
+  margin-bottom: 30px;
+}
+.setup-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.95);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.setup-overlay input {
+  font-size: 1.5em;
+  padding: 15px 20px;
+  border: 1px solid #333;
+  border-radius: 8px;
+  background: #1a1a1a;
+  color: #fff;
+  text-align: center;
+  width: 80%;
+  max-width: 400px;
+  margin-bottom: 20px;
+  -webkit-appearance: none;
+}
+.setup-overlay button, .btn {
+  font-size: 1.2em;
+  padding: 12px 30px;
+  border: none;
+  border-radius: 8px;
+  background: #2196f3;
+  color: #fff;
+  cursor: pointer;
+  -webkit-appearance: none;
+}
+.setup-overlay button:active, .btn:active {
+  background: #1976d2;
+}
+.setup-overlay h2 {
+  font-size: 2em;
+  margin-bottom: 30px;
+  font-weight: 300;
+}
+.preview-container {
+  margin-top: 20px;
+  position: relative;
+}
+.preview-container video {
+  width: 200px;
+  height: 150px;
+  border-radius: 8px;
+  background: #111;
+  object-fit: cover;
+  transition: transform 0.3s ease;
+}
+.rot-btn {
+  background: #222; color: #0f0; border: 1px solid #333;
+  padding: 6px 12px; margin: 2px; border-radius: 4px; font-size: 0.8em;
+  cursor: pointer;
+}
+.rot-btn.active { background: #0f0; color: #000; }
+.hidden { display: none !important; }
+.log {
+  margin-top: 20px;
+  font-size: 0.75em;
+  color: #444;
+  max-height: 100px;
+  overflow-y: auto;
+  width: 90%;
+  text-align: left;
+}
+</style>
+</head>
+<body>
+
+<!-- Setup overlay: ask for node name -->
+<div id="setup" class="setup-overlay hidden">
+  <h2>📡 Phone Home</h2>
+  <p style="color:#888; margin-bottom:20px;">Name this sensor node</p>
+  <input type="text" id="nameInput" placeholder="e.g. Kitchen, Front Door" autocomplete="off" autocorrect="off">
+  <button id="nameBtn">Connect</button>
+</div>
+
+<!-- Main display -->
+<div id="main" class="hidden">
+  <h1>📡 PHONE HOME</h1>
+  <div class="node-name" id="nodeName"></div>
+  <div class="status-line">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Connecting...</span>
+  </div>
+  <div class="last-command" id="lastCommand">No commands yet</div>
+  <div class="battery" id="batteryInfo"></div>
+  <!-- rotation not needed - browser handles orientation -->
+  <div class="preview-container">
+    <video id="preview" autoplay playsinline muted></video>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  // ---- Compatibility layer for iOS 10+ ----
+  // Use var throughout for iOS 10 compat
+  var nodeName = localStorage.getItem('phoneHomeName');
+  var nodeId = null;
+  var ws = null;
+  var mediaStream = null;
+  var canvas = null;
+  var canvasCtx = null;
+  var reconnectTimer = null;
+  var heartbeatTimer = null;
+  var streamingInterval = null;
+  var isStreaming = false;
+  var wsFailCount = 0;
+  var WS_FAIL_MAX = 3;
+  var pollMode = false;
+  var pollNodeId = null;
+  var pollTimer = null;
+
+  // iOS 10 compat: getUserMedia
+  function getUserMedia(constraints, successCb, errorCb) {
+    var nav = navigator;
+    if (nav.mediaDevices && nav.mediaDevices.getUserMedia) {
+      nav.mediaDevices.getUserMedia(constraints).then(successCb, errorCb);
+    } else {
+      // Fallback for older Safari
+      var gum = nav.getUserMedia || nav.webkitGetUserMedia || nav.mozGetUserMedia;
+      if (gum) {
+        gum.call(nav, constraints, successCb, errorCb);
+      } else {
+        errorCb(new Error('getUserMedia not supported'));
+      }
+    }
+  }
+
+  // ---- Feature detection ----
+  var isModern = typeof Promise !== 'undefined' && typeof Symbol !== 'undefined';
+  var hasMediaRecorder = typeof MediaRecorder !== 'undefined';
+
+  // ---- DOM refs ----
+  var setupEl = document.getElementById('setup');
+  var mainEl = document.getElementById('main');
+  var nameInput = document.getElementById('nameInput');
+  var nameBtn = document.getElementById('nameBtn');
+  var nodeNameEl = document.getElementById('nodeName');
+  var statusDot = document.getElementById('statusDot');
+  var statusText = document.getElementById('statusText');
+  var lastCommandEl = document.getElementById('lastCommand');
+  var batteryInfoEl = document.getElementById('batteryInfo');
+  var previewEl = document.getElementById('preview');
+  var logEl = document.getElementById('log');
+
+  // ---- Canvas for frame capture ----
+  canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  canvasCtx = canvas.getContext('2d');
+
+  // ---- Logging ----
+  function log(msg) {
+    var line = document.createElement('div');
+    line.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+    // Keep log short
+    while (logEl.children.length > 20) {
+      logEl.removeChild(logEl.firstChild);
+    }
+  }
+
+  // ---- Setup flow ----
+  function showSetup() {
+    setupEl.classList.remove('hidden');
+    mainEl.classList.add('hidden');
+  }
+
+  function showMain() {
+    setupEl.classList.add('hidden');
+    mainEl.classList.remove('hidden');
+    nodeNameEl.textContent = nodeName;
+  }
+
+  nameBtn.addEventListener('click', function() {
+    var name = nameInput.value.trim();
+    if (!name) return;
+    nodeName = name;
+    localStorage.setItem('phoneHomeName', nodeName);
+    showMain();
+    initCamera();
+    connectWS();
+  });
+
+  // Also allow Enter key
+  nameInput.addEventListener('keydown', function(e) {
+    if (e.keyCode === 13) nameBtn.click();
+  });
+
+  // ---- Video Quality Settings ----
+  // Presets: low (320x240), medium (640x480), high (1280x720)
+  var qualityPresets = {
+    low:    { w: 320,  h: 240,  snapQ: 0.6, streamQ: 0.3 },
+    medium: { w: 640,  h: 480,  snapQ: 0.85, streamQ: 0.5 },
+    high:   { w: 1280, h: 720,  snapQ: 0.92, streamQ: 0.7 }
+  };
+  var currentQuality = localStorage.getItem('ph-quality') || 'medium';
+  var qSettings = qualityPresets[currentQuality];
+
+  function setQuality(preset) {
+    if (!qualityPresets[preset]) return;
+    currentQuality = preset;
+    qSettings = qualityPresets[preset];
+    localStorage.setItem('ph-quality', preset);
+    log('Quality: ' + preset + ' (' + qSettings.w + 'x' + qSettings.h + ')');
+    // Reinit camera with new resolution
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(function(t) { t.stop(); });
+      mediaStream = null;
+    }
+    initCamera();
+  }
+
+  // ---- Camera ----
+  function initCamera() {
+    var constraints = {
+      video: { facingMode: 'environment', width: { ideal: qSettings.w }, height: { ideal: qSettings.h } },
+      audio: false
+    };
+
+    getUserMedia(constraints, function(stream) {
+      mediaStream = stream;
+      previewEl.srcObject = stream;
+      previewEl.play();
+      log('Camera ready');
+    }, function(err) {
+      log('Camera error: ' + err.message);
+      // Try without facing mode constraint (older iOS)
+      getUserMedia({ video: true, audio: false }, function(stream) {
+        mediaStream = stream;
+        previewEl.srcObject = stream;
+        previewEl.play();
+        log('Camera ready (fallback)');
+      }, function(err2) {
+        log('Camera failed: ' + err2.message);
+      });
+    });
+  }
+
+  // ---- WebSocket ----
+  function setStatus(state, text) {
+    statusDot.className = 'status-dot ' + state;
+    statusText.textContent = text;
+  }
+
+  function connectWS() {
+    if (ws) {
+      try { ws.close(); } catch(e) {}
+    }
+
+    setStatus('connecting', 'Connecting...');
+
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var url = protocol + '//' + location.host;
+
+    try {
+      ws = new WebSocket(url);
+    } catch(e) {
+      log('WebSocket error: ' + e.message);
+      scheduleReconnect();
+      return;
+    }
+
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = function() {
+      setStatus('connected', 'Connected');
+      log('Connected to hub');
+
+      // Gather device info
+      var ua = navigator.userAgent || '';
+      var iosMatch = ua.match(/OS (\d+[_\.]\d+)/);
+      var devInfo = {
+        platform: navigator.platform || '',
+        screenW: screen.width,
+        screenH: screen.height,
+        pixelRatio: window.devicePixelRatio || 1,
+        iosVersion: iosMatch ? iosMatch[1].replace('_', '.') : null,
+        userAgent: ua
+      };
+
+      // Register with our name + device info
+      wsSendJSON({ type: 'register', name: nodeName, deviceInfo: devInfo });
+      if (currentLocation) {
+        wsSendJSON({ type: 'location', location: currentLocation });
+      }
+
+      // Start heartbeat
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(sendHeartbeat, 30000);
+      sendHeartbeat();
+    };
+
+    ws.onclose = function() {
+      setStatus('disconnected', 'Disconnected');
+      log('Disconnected');
+      stopStreaming();
+      clearInterval(heartbeatTimer);
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      log('Connection error');
+    };
+
+    ws.onmessage = function(evt) {
+      if (typeof evt.data === 'string') {
+        try {
+          var msg = JSON.parse(evt.data);
+          handleCommand(msg);
+        } catch(e) {
+          log('Bad message: ' + e.message);
+        }
+      }
+    };
+  }
+
+  function wsSendJSON(obj) {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  function scheduleReconnect() {
+    wsFailCount++;
+    if (wsFailCount >= WS_FAIL_MAX && !pollMode) {
+      log('WS failed ' + wsFailCount + 'x — switching to poll mode');
+      startPolling();
+      return;
+    }
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(function() {
+      log('Reconnecting...');
+      connectWS();
+    }, 3000);
+  }
+
+  // ---- Polling fallback ----
+  function pollFetch(url, opts) {
+    opts = opts || {};
+    opts.method = opts.method || 'POST';
+    if (opts.jsonBody) {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(opts.jsonBody);
+      delete opts.jsonBody;
+    }
+    return fetch(location.origin + url, opts);
+  }
+
+  function startPolling() {
+    pollMode = true;
+    setStatus('connecting', 'Registering (poll)...');
+
+    var ua = navigator.userAgent || '';
+    var iosMatch = ua.match(/OS (\d+[_\.]\d+)/);
+    var devInfo = {
+      platform: navigator.platform || '',
+      screenW: screen.width,
+      screenH: screen.height,
+      pixelRatio: window.devicePixelRatio || 1,
+      iosVersion: iosMatch ? iosMatch[1].replace('_', '.') : null,
+      userAgent: ua
+    };
+
+    pollFetch('/api/poll/register', { jsonBody: { name: nodeName, deviceInfo: devInfo } })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        pollNodeId = data.id;
+        nodeId = data.id;
+        setStatus('connected', 'Connected (poll)');
+        log('Poll mode active, ID: ' + pollNodeId);
+        // Start poll loop
+        pollLoop();
+        // Start heartbeat polling
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = setInterval(pollLoop, 3000);
+      })
+      .catch(function(e) {
+        log('Poll register failed: ' + e.message);
+        setStatus('disconnected', 'Disconnected');
+        setTimeout(startPolling, 5000);
+      });
+  }
+
+  function pollLoop() {
+    if (!pollNodeId) return;
+    var body = { battery: null };
+    if (currentLocation) body.location = currentLocation;
+
+    pollFetch('/api/poll/' + pollNodeId + '/poll', { jsonBody: body })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.commands) {
+          for (var i = 0; i < data.commands.length; i++) {
+            handleCommand(data.commands[i]);
+          }
+        }
+      })
+      .catch(function(e) {
+        log('Poll error: ' + e.message);
+      });
+  }
+
+  // Override snap to use POST in poll mode
+  var _origCaptureFrame = null;
+
+  // ---- GPS Location ----
+  var currentLocation = null;
+
+  function setupGPS() {
+    if (!navigator.geolocation) {
+      log('GPS: not available');
+      return;
+    }
+
+    // Get initial position
+    navigator.geolocation.getCurrentPosition(function(pos) {
+      currentLocation = {
+        lat: Math.round(pos.coords.latitude * 1000000) / 1000000,
+        lng: Math.round(pos.coords.longitude * 1000000) / 1000000,
+        accuracy: Math.round(pos.coords.accuracy)
+      };
+      log('GPS: ' + currentLocation.lat + ', ' + currentLocation.lng + ' (±' + currentLocation.accuracy + 'm)');
+      if (ws && ws.readyState === 1) {
+        wsSendJSON({ type: 'location', location: currentLocation });
+      }
+    }, function(err) {
+      log('GPS error: ' + err.message);
+    }, { enableHighAccuracy: true, timeout: 10000 });
+
+    // Watch for changes
+    navigator.geolocation.watchPosition(function(pos) {
+      currentLocation = {
+        lat: Math.round(pos.coords.latitude * 1000000) / 1000000,
+        lng: Math.round(pos.coords.longitude * 1000000) / 1000000,
+        accuracy: Math.round(pos.coords.accuracy)
+      };
+      if (ws && ws.readyState === 1) {
+        wsSendJSON({ type: 'location', location: currentLocation });
+      }
+    }, function() {}, { enableHighAccuracy: false, maximumAge: 60000, timeout: 30000 });
+  }
+
+  // ---- Tamper Detection (Accelerometer) ----
+  var lastAccel = { x: 0, y: 0, z: 0 };
+  var accelCalibrated = false;
+  var tamperCooldown = false;
+  var TAMPER_THRESHOLD = 2.5; // m/s² delta to trigger
+
+  function setupAccelerometer() {
+    // iOS 13+ requires permission request
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      DeviceMotionEvent.requestPermission().then(function(state) {
+        if (state === 'granted') {
+          window.addEventListener('devicemotion', handleMotion, false);
+          log('Accelerometer: granted');
+        }
+      }).catch(function(e) { log('Accel permission error: ' + e); });
+    } else if ('DeviceMotionEvent' in window) {
+      window.addEventListener('devicemotion', handleMotion, false);
+      log('Accelerometer: active');
+    } else {
+      log('Accelerometer: not available');
+    }
+  }
+
+  function handleMotion(event) {
+    var a = event.accelerationIncludingGravity;
+    if (!a || a.x === null) return;
+
+    if (!accelCalibrated) {
+      lastAccel = { x: a.x, y: a.y, z: a.z };
+      accelCalibrated = true;
+      return;
+    }
+
+    var dx = Math.abs(a.x - lastAccel.x);
+    var dy = Math.abs(a.y - lastAccel.y);
+    var dz = Math.abs(a.z - lastAccel.z);
+    var delta = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    lastAccel = { x: a.x, y: a.y, z: a.z };
+
+    if (delta > TAMPER_THRESHOLD && !tamperCooldown && ws && ws.readyState === 1) {
+      tamperCooldown = true;
+      wsSendJSON({ type: 'tamper', delta: Math.round(delta * 100) / 100 });
+      log('⚠️ Tamper: ' + delta.toFixed(1) + ' m/s²');
+      setTimeout(function() { tamperCooldown = false; }, 10000); // 10s cooldown
+    }
+  }
+
+  // ---- Heartbeat ----
+  function sendHeartbeat() {
+    var batteryLevel = null;
+
+    // Try to get battery info (not available on all iOS versions)
+    if (navigator.getBattery) {
+      navigator.getBattery().then(function(batt) {
+        batteryLevel = Math.round(batt.level * 100);
+        batteryInfoEl.textContent = '🔋 ' + batteryLevel + '%' + (batt.charging ? ' ⚡' : '');
+        wsSendJSON({ type: 'heartbeat', battery: batteryLevel });
+      });
+    } else {
+      wsSendJSON({ type: 'heartbeat', battery: null });
+    }
+  }
+
+  // ---- Command handlers ----
+  function handleCommand(msg) {
+    switch(msg.type) {
+      case 'welcome':
+        nodeId = msg.id;
+        log('Assigned ID: ' + nodeId);
+        break;
+
+      case 'snap':
+        lastCommandEl.textContent = '📸 Snap requested';
+        log('Snap requested');
+        captureFrame(msg.requestId);
+        break;
+
+      case 'listen':
+        var duration = msg.duration || 5;
+        lastCommandEl.textContent = '🎤 Listening (' + duration + 's)';
+        log('Audio capture: ' + duration + 's');
+        captureAudio(msg.requestId, duration);
+        break;
+
+      case 'start-stream':
+        lastCommandEl.textContent = '📹 Streaming (motion detect)';
+        log('Streaming started');
+        startStreaming();
+        break;
+
+      case 'stop-stream':
+        lastCommandEl.textContent = '⏹ Stream stopped';
+        log('Streaming stopped');
+        stopStreaming();
+        break;
+
+      case 'set-quality':
+        var preset = msg.quality || 'medium';
+        setQuality(preset);
+        lastCommandEl.textContent = '📐 Quality: ' + preset;
+        break;
+
+      default:
+        log('Unknown command: ' + msg.type);
+    }
+  }
+
+  // ---- Frame capture ----
+  function captureFrame(requestId) {
+    if (!mediaStream) {
+      if (!pollMode) wsSendJSON({ type: 'error', requestId: requestId, message: 'No camera' });
+      return;
+    }
+
+    var video = previewEl;
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    if (pollMode) {
+      // Send via fetch POST
+      if (canvas.toBlob) {
+        canvas.toBlob(function(blob) {
+          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+            method: 'POST',
+            headers: { 'Content-Type': 'image/jpeg' },
+            body: blob
+          }).catch(function(e) { log('Snap upload err: ' + e.message); });
+        }, 'image/jpeg', qSettings.snapQ);
+      } else {
+        var dataUrl = canvas.toDataURL('image/jpeg', qSettings.snapQ);
+        var binary = atob(dataUrl.split(',')[1]);
+        var arr = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+        fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: arr
+        }).catch(function(e) { log('Snap upload err: ' + e.message); });
+      }
+      lastCommandEl.textContent = '📸 Snap sent @ ' + new Date().toLocaleTimeString();
+      return;
+    }
+
+    // WebSocket mode
+    wsSendJSON({ type: 'snap-result', requestId: requestId });
+
+    if (canvas.toBlob) {
+      canvas.toBlob(function(blob) {
+        var reader = new FileReader();
+        reader.onload = function() {
+          if (ws && ws.readyState === 1) {
+            ws.send(reader.result);
+          }
+        };
+        reader.readAsArrayBuffer(blob);
+      }, 'image/jpeg', qSettings.snapQ);
+    } else {
+      var dataUrl = canvas.toDataURL('image/jpeg', qSettings.snapQ);
+      var binary = atob(dataUrl.split(',')[1]);
+      var arr = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) {
+        arr[i] = binary.charCodeAt(i);
+      }
+      if (ws && ws.readyState === 1) {
+        ws.send(arr.buffer);
+      }
+    }
+
+    lastCommandEl.textContent = '📸 Snap sent @ ' + new Date().toLocaleTimeString();
+  }
+
+  // ---- Audio capture ----
+  function captureAudio(requestId, duration) {
+    if (!hasMediaRecorder) {
+      wsSendJSON({ type: 'error', requestId: requestId, message: 'MediaRecorder not supported' });
+      log('MediaRecorder not available on this device');
+      return;
+    }
+
+    getUserMedia({ audio: true, video: false }, function(audioStream) {
+      var chunks = [];
+      var mimeType = 'audio/webm';
+
+      // Safari might not support webm
+      if (typeof MediaRecorder.isTypeSupported === 'function') {
+        if (MediaRecorder.isTypeSupported('audio/webm')) {
+          mimeType = 'audio/webm';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        }
+      }
+
+      var recorder;
+      try {
+        recorder = new MediaRecorder(audioStream, { mimeType: mimeType });
+      } catch(e) {
+        // Fallback: no mime type specified
+        recorder = new MediaRecorder(audioStream);
+      }
+
+      recorder.ondataavailable = function(e) {
+        if (e.data && e.data.size > 0) {
+          chunks.push(e.data);
+        }
+      };
+
+      recorder.onstop = function() {
+        // Stop audio stream tracks
+        audioStream.getTracks().forEach(function(t) { t.stop(); });
+
+        var blob = new Blob(chunks, { type: mimeType });
+        var reader = new FileReader();
+        reader.onload = function() {
+          wsSendJSON({ type: 'listen-result', requestId: requestId });
+          if (ws && ws.readyState === 1) {
+            ws.send(reader.result);
+          }
+          lastCommandEl.textContent = '🎤 Audio sent @ ' + new Date().toLocaleTimeString();
+        };
+        reader.readAsArrayBuffer(blob);
+      };
+
+      recorder.start();
+      log('Recording...');
+
+      setTimeout(function() {
+        if (recorder.state === 'recording') {
+          recorder.stop();
+        }
+      }, duration * 1000);
+
+    }, function(err) {
+      wsSendJSON({ type: 'error', requestId: requestId, message: 'Mic access denied: ' + err.message });
+      log('Mic error: ' + err.message);
+    });
+  }
+
+  // ---- Streaming (for motion detection) ----
+  function startStreaming() {
+    if (isStreaming) return;
+    isStreaming = true;
+
+    // Send a frame every 2 seconds
+    streamingInterval = setInterval(function() {
+      if (!mediaStream) return;
+      if (!pollMode && (!ws || ws.readyState !== 1)) return;
+
+      var video = previewEl;
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      if (pollMode) {
+        // Use fetch
+        if (canvas.toBlob) {
+          canvas.toBlob(function(blob) {
+            fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+              method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob
+            }).catch(function() {});
+          }, 'image/jpeg', qSettings.streamQ);
+        } else {
+          var du = canvas.toDataURL('image/jpeg', qSettings.streamQ);
+          var b = atob(du.split(',')[1]);
+          var a = new Uint8Array(b.length);
+          for (var j = 0; j < b.length; j++) a[j] = b.charCodeAt(j);
+          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+            method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: a
+          }).catch(function() {});
+        }
+        return;
+      }
+
+      if (canvas.toBlob) {
+        canvas.toBlob(function(blob) {
+          var reader = new FileReader();
+          reader.onload = function() {
+            if (ws && ws.readyState === 1) ws.send(reader.result);
+          };
+          reader.readAsArrayBuffer(blob);
+        }, 'image/jpeg', qSettings.streamQ);
+      } else {
+        var dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+        var binary = atob(dataUrl.split(',')[1]);
+        var arr = new Uint8Array(binary.length);
+        for (var i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+        if (ws && ws.readyState === 1) ws.send(arr.buffer);
+      }
+    }, 2000);
+  }
+
+  function stopStreaming() {
+    isStreaming = false;
+    clearInterval(streamingInterval);
+  }
+
+  // ---- Keep screen awake (newer iOS) ----
+  function keepAwake() {
+    if ('wakeLock' in navigator) {
+      navigator.wakeLock.request('screen').catch(function() {});
+    }
+  }
+
+  // ---- Init ----
+  // ---- Register service worker ----
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').then(function() {
+      log('PWA ready');
+    }).catch(function() {});
+  }
+
+  if (nodeName) {
+    showMain();
+    initCamera();
+    setupAccelerometer();
+    setupGPS();
+    connectWS();
+    keepAwake();
+  } else {
+    showSetup();
+  }
+
+})();
+</script>
+</body>
+</html>

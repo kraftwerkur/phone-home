@@ -1,0 +1,14 @@
+{
+  "name": "Phone Home — Command",
+  "short_name": "PH Command",
+  "description": "Phone Home admin dashboard",
+  "start_url": "/admin/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

@@ -1,0 +1,886 @@
+// Phone Home — Hub Server v0.1
+// Express + WebSocket hub that manages iPhone sensor nodes
+
+import express from 'express';
+import { createServer } from 'http';
+import { createServer as createHttpsServer } from 'https';
+import { WebSocketServer } from 'ws';
+import { v4 as uuidv4 } from 'uuid';
+import sharp from 'sharp';
+import { execFile } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+
+// ---------- Telegram ----------
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_ENABLED = !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+if (!TELEGRAM_ENABLED) {
+  console.log('⚠️  Telegram alerting disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable)');
+}
+
+async function sendTelegramAlert(alert) {
+  const caption = `🚨 *Person detected* on *${alert.nodeName}*\n` +
+    `${alert.description || 'No description'}\n` +
+    `👥 ${alert.personCount} person(s) | ${alert.pctChanged}% motion\n` +
+    `🕐 ${new Date(alert.timestamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York' })}`;
+
+  // Send thumbnail with caption
+  if (alert.thumbnail && fs.existsSync(alert.thumbnail)) {
+    const form = new FormData();
+    form.append('chat_id', TELEGRAM_CHAT_ID);
+    form.append('caption', caption);
+    form.append('parse_mode', 'Markdown');
+    form.append('photo', new Blob([fs.readFileSync(alert.thumbnail)]), 'alert.jpg');
+    
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+      method: 'POST',
+      body: form,
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Telegram API: ${res.status} ${err}`);
+    }
+    console.log(`[📱] Telegram alert sent for ${alert.nodeName}`);
+  } else {
+    // Text-only fallback
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: caption, parse_mode: 'Markdown' }),
+    });
+    console.log(`[📱] Telegram text alert sent for ${alert.nodeName}`);
+  }
+}
+
+// ---------- Config ----------
+const PORT = parseInt(process.env.PORT || '3900', 10);
+const SNAPSHOT_DIR = path.join(PROJECT_ROOT, 'data', 'snapshots');
+const AUDIO_DIR = path.join(PROJECT_ROOT, 'data', 'audio');
+const MOTION_THRESHOLD = 5;        // percent of pixels changed to trigger motion
+const MOTION_PIXEL_DIFF = 30;      // per-channel difference to count as "changed"
+const CLIP_DURATION_MS = 5000;     // record 5 seconds of video on motion
+const CLIP_DIR = path.join(PROJECT_ROOT, 'data', 'clips');
+
+// Bandwidth history: per-node samples every 10s for last 30min (180 samples)
+const bwHistory = new Map(); // nodeId → [{ ts, bytesIn, bytesOut }]
+const BW_SAMPLE_INTERVAL = 10000;
+const BW_MAX_SAMPLES = 180;
+
+setInterval(() => {
+  for (const [id, node] of nodes) {
+    if (!bwHistory.has(id)) bwHistory.set(id, []);
+    const history = bwHistory.get(id);
+    history.push({ ts: Date.now(), bytesIn: node.bytesIn, bytesOut: node.bytesOut });
+    if (history.length > BW_MAX_SAMPLES) history.shift();
+  }
+}, BW_SAMPLE_INTERVAL);
+
+// Ensure data dirs exist
+fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+fs.mkdirSync(AUDIO_DIR, { recursive: true });
+fs.mkdirSync(CLIP_DIR, { recursive: true });
+
+// ---------- State ----------
+
+// Connected nodes: Map<wsId, { ws, id, name, connectedAt, lastHeartbeat, battery, motionEnabled }>
+const nodes = new Map();
+
+// Pending requests: Map<requestId, { resolve, reject, timer }>
+const pending = new Map();
+
+// Previous frame per node for motion detection (raw pixel buffer)
+const prevFrames = new Map();
+
+// Admin WebSocket clients
+const adminClients = new Set();
+
+function broadcastToAdmins(msg) {
+  const data = JSON.stringify(msg);
+  for (const ws of adminClients) {
+    if (ws.readyState === 1) ws.send(data);
+  }
+}
+
+// ---------- Express ----------
+const app = express();
+app.use(express.json());
+
+// Serve web client
+app.use(express.static(path.join(PROJECT_ROOT, 'client')));
+
+// Serve admin dashboard
+app.use('/admin', express.static(path.join(PROJECT_ROOT, 'admin')));
+
+// Serve CA cert for easy install on iPhones
+app.get('/cert', (_req, res) => {
+  const certPath = path.join(__dirname, 'certs', 'cert.der');
+  res.setHeader('Content-Type', 'application/x-x509-ca-cert');
+  res.setHeader('Content-Disposition', 'inline; filename="phonehome.cer"');
+  res.sendFile(certPath);
+});
+
+// --- Polling fallback for old iOS that can't do wss:// with self-signed certs ---
+// Register a polling node
+app.post('/api/poll/register', (req, res) => {
+  const { name, deviceInfo } = req.body;
+  const id = uuidv4();
+  const node = {
+    ws: null,
+    id,
+    name: name || 'unnamed',
+    connectedAt: new Date().toISOString(),
+    lastHeartbeat: Date.now(),
+    battery: null,
+    orientation: 0,
+    location: null,
+    motionEnabled: false,
+    bytesIn: 0,
+    bytesOut: 0,
+    userAgent: req.headers['user-agent'] || 'unknown',
+    deviceInfo: deviceInfo || null,
+    quality: 'medium',
+    polling: true,
+    pendingCommands: [],
+  };
+  nodes.set(id, node);
+  if (deviceInfo) {
+    console.log(`[+] Poll node registered: ${id} as "${name}" — ${deviceInfo.platform || ''} ${deviceInfo.screenW}x${deviceInfo.screenH} iOS${deviceInfo.iosVersion || '?'}`);
+  } else {
+    console.log(`[+] Poll node registered: ${id} as "${name}"`);
+  }
+  broadcastToAdmins({ type: 'node-connected', id, connectedAt: node.connectedAt });
+  res.json({ id });
+});
+
+// Poll for commands
+app.post('/api/poll/:id/poll', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Unknown node' });
+  node.lastHeartbeat = Date.now();
+  if (req.body.battery != null) node.battery = req.body.battery;
+  if (req.body.location) node.location = req.body.location;
+  const cmds = node.pendingCommands || [];
+  node.pendingCommands = [];
+  res.json({ commands: cmds });
+});
+
+// Receive a snap via POST (polling nodes)
+app.post('/api/poll/:id/snap', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Unknown node' });
+  // Expect raw JPEG body
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    const buf = Buffer.concat(chunks);
+    node.bytesIn += buf.length;
+    const nodeDir = path.join(SNAPSHOT_DIR, req.params.id);
+    fs.mkdirSync(nodeDir, { recursive: true });
+    const snapPath = path.join(nodeDir, 'latest.jpg');
+    fs.writeFileSync(snapPath, buf);
+    // Also handle motion detection if streaming
+    if (node.motionEnabled) {
+      handleBinaryMessage(req.params.id, buf);
+    }
+    res.json({ ok: true });
+  });
+});
+
+// Override sendCommand to support polling nodes
+const _origSendCommand = function(node, type, payload) {
+  if (node.ws && node.ws.readyState === 1) {
+    const msg = JSON.stringify({ type, ...payload });
+    node.bytesOut += Buffer.byteLength(msg);
+    node.ws.send(msg);
+  } else if (node.polling) {
+    if (!node.pendingCommands) node.pendingCommands = [];
+    node.pendingCommands.push({ type, ...payload });
+  }
+};
+
+// --- REST API for Reef ---
+
+// List connected nodes
+app.get('/api/nodes', (_req, res) => {
+  const list = [];
+  for (const [id, node] of nodes) {
+    list.push({
+      id,
+      name: node.name,
+      connectedAt: node.connectedAt,
+      lastHeartbeat: node.lastHeartbeat,
+      battery: node.battery,
+      location: node.location,
+      motionEnabled: node.motionEnabled,
+      bytesIn: node.bytesIn,
+      bytesOut: node.bytesOut,
+      motionThreshold: node.motionThreshold || MOTION_THRESHOLD,
+      quality: node.quality || 'medium',
+      userAgent: node.userAgent,
+      deviceInfo: node.deviceInfo,
+    });
+  }
+  res.json(list);
+});
+
+// Request a snapshot from a node
+app.post('/api/nodes/:id/snap', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  const requestId = uuidv4();
+  sendCommand(node, 'snap', { requestId });
+
+  waitForResponse(requestId, 15000)
+    .then((result) => res.json(result))
+    .catch((err) => res.status(504).json({ error: err.message }));
+});
+
+// Request audio from a node
+app.post('/api/nodes/:id/listen', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  const duration = req.body.duration || 5;
+  const requestId = uuidv4();
+  sendCommand(node, 'listen', { requestId, duration });
+
+  // Audio takes longer — timeout = duration + 10s buffer
+  waitForResponse(requestId, (duration + 10) * 1000)
+    .then((result) => res.json(result))
+    .catch((err) => res.status(504).json({ error: err.message }));
+});
+
+// Get latest snapshot for a node
+app.get('/api/snapshots/:id/latest', (req, res) => {
+  const nodeDir = path.join(SNAPSHOT_DIR, req.params.id);
+  if (!fs.existsSync(nodeDir)) return res.status(404).json({ error: 'No snapshots' });
+
+  const files = fs.readdirSync(nodeDir).filter(f => f.endsWith('.jpg')).sort();
+  if (files.length === 0) return res.status(404).json({ error: 'No snapshots' });
+
+  const latest = path.join(nodeDir, files[files.length - 1]);
+  res.sendFile(latest);
+});
+
+// Get recent motion alerts
+app.get('/api/alerts', (_req, res) => {
+  const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
+  if (!fs.existsSync(alertDir)) return res.json([]);
+  const files = fs.readdirSync(alertDir).filter(f => f.endsWith('.json')).sort().slice(-20);
+  const alerts = files.map(f => JSON.parse(fs.readFileSync(path.join(alertDir, f), 'utf-8')));
+  res.json(alerts);
+});
+
+// Clear alerts (after reading)
+app.delete('/api/alerts', (_req, res) => {
+  const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
+  if (fs.existsSync(alertDir)) {
+    fs.readdirSync(alertDir).forEach(f => fs.unlinkSync(path.join(alertDir, f)));
+  }
+  res.json({ cleared: true });
+});
+
+// Get system stats
+app.get('/api/stats', (_req, res) => {
+  const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
+  let alertCount = 0;
+  if (fs.existsSync(alertDir)) {
+    const today = new Date().toISOString().slice(0, 10);
+    alertCount = fs.readdirSync(alertDir).filter(f => {
+      try {
+        const alert = JSON.parse(fs.readFileSync(path.join(alertDir, f), 'utf-8'));
+        return alert.timestamp && alert.timestamp.startsWith(today);
+      } catch { return false; }
+    }).length;
+  }
+
+  // Disk usage for data dir
+  let diskUsage = 0;
+  const dataDir = path.join(PROJECT_ROOT, 'data');
+  function dirSize(dir) {
+    if (!fs.existsSync(dir)) return 0;
+    let size = 0;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) size += dirSize(p);
+      else try { size += fs.statSync(p).size; } catch {}
+    }
+    return size;
+  }
+  diskUsage = dirSize(dataDir);
+
+  res.json({
+    nodeCount: nodes.size,
+    alertCount,
+    diskUsage,
+    uptime: process.uptime(),
+  });
+});
+
+// Update motion threshold per node
+app.post('/api/nodes/:id/threshold', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+  const threshold = parseFloat(req.body.threshold);
+  if (isNaN(threshold) || threshold < 0 || threshold > 100) {
+    return res.status(400).json({ error: 'Invalid threshold (0-100)' });
+  }
+  node.motionThreshold = threshold;
+  res.json({ id: req.params.id, motionThreshold: threshold });
+});
+
+// Serve clip video files
+app.get('/api/clips/:nodeId/:filename', (req, res) => {
+  const clipPath = path.join(CLIP_DIR, req.params.nodeId, req.params.filename);
+  if (!fs.existsSync(clipPath)) return res.status(404).json({ error: 'Clip not found' });
+  res.sendFile(clipPath);
+});
+
+// Serve alert thumbnails
+app.get('/api/thumbs/:nodeId/:filename', (req, res) => {
+  const thumbPath = path.join(CLIP_DIR, req.params.nodeId, req.params.filename);
+  if (!fs.existsSync(thumbPath)) return res.status(404).json({ error: 'Thumbnail not found' });
+  res.sendFile(thumbPath);
+});
+
+// Bandwidth history for a node (last 30 min)
+app.get('/api/nodes/:id/bandwidth', (req, res) => {
+  const history = bwHistory.get(req.params.id) || [];
+  // Convert cumulative bytes to per-interval rates
+  const rates = [];
+  for (let i = 1; i < history.length; i++) {
+    const dt = (history[i].ts - history[i-1].ts) / 1000; // seconds
+    rates.push({
+      ts: history[i].ts,
+      inRate: Math.round((history[i].bytesIn - history[i-1].bytesIn) / dt),   // bytes/sec
+      outRate: Math.round((history[i].bytesOut - history[i-1].bytesOut) / dt),
+    });
+  }
+  res.json(rates);
+});
+
+// Set video quality for a node
+app.post('/api/nodes/:id/quality', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+  const quality = req.body.quality || 'medium';
+  if (!['low', 'medium', 'high'].includes(quality)) return res.status(400).json({ error: 'Invalid quality: low, medium, high' });
+  sendCommand(node, 'set-quality', { quality });
+  node.quality = quality;
+  res.json({ quality });
+});
+
+// Configure motion detection for a node
+app.post('/api/nodes/:id/motion', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  node.motionEnabled = !!req.body.enabled;
+  if (node.motionEnabled) {
+    sendCommand(node, 'start-stream', {});
+  } else {
+    sendCommand(node, 'stop-stream', {});
+    prevFrames.delete(req.params.id);
+  }
+  res.json({ motionEnabled: node.motionEnabled });
+});
+
+// ---------- HTTP + WS Server ----------
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+function handleWSConnection(ws, req) {
+  // Check if this is an admin client
+  const url = new URL(req.url, 'http://localhost');
+  if (url.searchParams.get('role') === 'admin') {
+    adminClients.add(ws);
+    ws.send(JSON.stringify({ type: 'admin-welcome' }));
+    console.log(`[+] Admin client connected (${adminClients.size} total)`);
+    ws.on('close', () => {
+      adminClients.delete(ws);
+      console.log(`[-] Admin client disconnected (${adminClients.size} total)`);
+    });
+    return;
+  }
+
+  const id = uuidv4();
+  const userAgent = req.headers['user-agent'] || 'unknown';
+  const node = {
+    ws,
+    id,
+    name: null,
+    connectedAt: new Date().toISOString(),
+    lastHeartbeat: Date.now(),
+    battery: null,
+    orientation: 0,
+    location: null,
+    motionEnabled: false,
+    bytesIn: 0,
+    bytesOut: 0,
+    userAgent,
+    deviceInfo: null,
+  };
+  nodes.set(id, node);
+
+  // Tell the client its assigned ID
+  ws.send(JSON.stringify({ type: 'welcome', id }));
+  console.log(`[+] Node connected: ${id} — ${userAgent}`);
+  broadcastToAdmins({ type: 'node-connected', id, connectedAt: node.connectedAt });
+
+  ws.on('message', (data, isBinary) => {
+    const node = nodes.get(id);
+    if (node) node.bytesIn += isBinary ? data.length : Buffer.byteLength(data.toString());
+    if (isBinary) {
+      handleBinaryMessage(id, data);
+      return;
+    }
+    try {
+      const msg = JSON.parse(data.toString());
+      handleJsonMessage(id, msg);
+    } catch (e) {
+      console.error(`[!] Bad JSON from ${id}:`, e.message);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[-] Node disconnected: ${id} (${node.name || 'unnamed'})`);
+    broadcastToAdmins({ type: 'node-disconnected', id, name: node.name });
+    nodes.delete(id);
+    prevFrames.delete(id);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[!] WS error from ${id}:`, err.message);
+  });
+}
+
+wss.on('connection', handleWSConnection);
+
+// ---------- Message Handlers ----------
+
+function handleJsonMessage(nodeId, msg) {
+  const node = nodes.get(nodeId);
+  if (!node) return;
+
+  switch (msg.type) {
+    case 'register':
+      node.name = msg.name || 'unnamed';
+      if (msg.deviceInfo) {
+        node.deviceInfo = msg.deviceInfo;
+        console.log(`[i] Node ${nodeId} registered as "${node.name}" — ${msg.deviceInfo.platform || ''} ${msg.deviceInfo.screenW}x${msg.deviceInfo.screenH} iOS${msg.deviceInfo.iosVersion || '?'}`);
+      } else {
+        console.log(`[i] Node ${nodeId} registered as "${node.name}"`);
+      }
+      break;
+
+    case 'heartbeat':
+      node.lastHeartbeat = Date.now();
+      node.battery = msg.battery != null ? msg.battery : null;
+      break;
+
+    case 'orientation':
+      node.orientation = msg.angle || 0;
+      console.log(`[📐] Node ${node.name || nodeId} orientation: ${node.orientation}°`);
+      break;
+
+    case 'location':
+      node.location = msg.location || null;
+      if (node.location) {
+        console.log(`[📍] Node ${node.name || nodeId} location: ${node.location.lat}, ${node.location.lng} (±${node.location.accuracy}m)`);
+      }
+      break;
+
+    case 'tamper': {
+      const nodeName = node.name || nodeId;
+      const now = Date.now();
+      console.log(`[🚨] TAMPER on ${nodeName}: ${msg.delta} m/s²`);
+
+      const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
+      fs.mkdirSync(alertDir, { recursive: true });
+      const alert = {
+        type: 'tamper',
+        nodeId,
+        nodeName,
+        delta: msg.delta,
+        location: node.location || null,
+        timestamp: new Date().toISOString(),
+      };
+      fs.writeFileSync(path.join(alertDir, `tamper-${now}.json`), JSON.stringify(alert));
+      broadcastToAdmins({ type: 'alert', alert });
+      break;
+    }
+
+    case 'snap-result': {
+      // The actual image data comes as the next binary message tagged with requestId
+      // Store requestId so binary handler knows what it's for
+      node._pendingSnapRequestId = msg.requestId;
+      break;
+    }
+
+    case 'listen-result': {
+      node._pendingAudioRequestId = msg.requestId;
+      break;
+    }
+
+    case 'error':
+      console.error(`[!] Error from ${node.name || nodeId}: ${msg.message}`);
+      if (msg.requestId && pending.has(msg.requestId)) {
+        resolvePending(msg.requestId, null, new Error(msg.message));
+      }
+      break;
+
+    default:
+      console.log(`[?] Unknown message type from ${nodeId}: ${msg.type}`);
+  }
+}
+
+async function handleBinaryMessage(nodeId, data) {
+  const node = nodes.get(nodeId);
+  if (!node) return;
+
+  const buffer = Buffer.from(data);
+
+  // Check if this is a snap response
+  if (node._pendingSnapRequestId) {
+    const requestId = node._pendingSnapRequestId;
+    node._pendingSnapRequestId = null;
+    await saveSnapshot(nodeId, buffer, requestId);
+    return;
+  }
+
+  // Check if this is an audio response
+  if (node._pendingAudioRequestId) {
+    const requestId = node._pendingAudioRequestId;
+    node._pendingAudioRequestId = null;
+    await saveAudio(nodeId, buffer, requestId);
+    return;
+  }
+
+  // Otherwise it's a streaming frame (for motion detection)
+  if (node.motionEnabled) {
+    await checkMotion(nodeId, buffer);
+  }
+}
+
+// ---------- Snapshot / Audio Storage ----------
+
+async function saveSnapshot(nodeId, buffer, requestId) {
+  const nodeDir = path.join(SNAPSHOT_DIR, nodeId);
+  fs.mkdirSync(nodeDir, { recursive: true });
+
+  const filename = `${Date.now()}.jpg`;
+  const filepath = path.join(nodeDir, filename);
+  fs.writeFileSync(filepath, buffer);
+
+  console.log(`[📸] Snapshot saved: ${filepath} (${buffer.length} bytes)`);
+  resolvePending(requestId, {
+    nodeId,
+    filename,
+    size: buffer.length,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+async function saveAudio(nodeId, buffer, requestId) {
+  const nodeDir = path.join(AUDIO_DIR, nodeId);
+  fs.mkdirSync(nodeDir, { recursive: true });
+
+  const filename = `${Date.now()}.webm`;
+  const filepath = path.join(nodeDir, filename);
+  fs.writeFileSync(filepath, buffer);
+
+  console.log(`[🎤] Audio saved: ${filepath} (${buffer.length} bytes)`);
+  resolvePending(requestId, {
+    nodeId,
+    filename,
+    size: buffer.length,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ---------- Motion Detection + Clip Recording ----------
+
+// Per-node clip recording state
+// { recording: bool, frames: [{buffer, ts}], startTs, bestFrame: {buffer, sharpness} }
+const clipState = new Map();
+
+async function checkMotion(nodeId, jpegBuffer) {
+  try {
+    const node = nodes.get(nodeId);
+    if (!node) return;
+
+    // If currently recording a clip, just collect frames
+    const clip = clipState.get(nodeId);
+    if (clip && clip.recording) {
+      clip.frames.push({ buffer: jpegBuffer, ts: Date.now() });
+      // Track sharpest frame (Laplacian variance approximation via sharp)
+      try {
+        const stats = await sharp(jpegBuffer).resize(160, 120).greyscale().stats();
+        const sharpness = stats.channels[0].stdev; // higher stdev = sharper
+        if (!clip.bestFrame || sharpness > clip.bestFrame.sharpness) {
+          clip.bestFrame = { buffer: jpegBuffer, sharpness };
+        }
+      } catch (_) {}
+
+      // Check if clip duration elapsed
+      if (Date.now() - clip.startTs >= CLIP_DURATION_MS) {
+        clip.recording = false;
+        finalizeClip(nodeId);
+      }
+      return;
+    }
+
+    // Normal motion detection (compare frames)
+    const { data: pixels, info } = await sharp(jpegBuffer)
+      .resize(160, 120, { fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const prev = prevFrames.get(nodeId);
+    prevFrames.set(nodeId, pixels);
+
+    if (!prev || prev.length !== pixels.length) return;
+
+    const totalPixels = info.width * info.height;
+    let changedPixels = 0;
+    for (let i = 0; i < pixels.length; i += 3) {
+      const dr = Math.abs(pixels[i] - prev[i]);
+      const dg = Math.abs(pixels[i + 1] - prev[i + 1]);
+      const db = Math.abs(pixels[i + 2] - prev[i + 2]);
+      if (dr > MOTION_PIXEL_DIFF || dg > MOTION_PIXEL_DIFF || db > MOTION_PIXEL_DIFF) {
+        changedPixels++;
+      }
+    }
+
+    const pctChanged = (changedPixels / totalPixels) * 100;
+    const threshold = node.motionThreshold || MOTION_THRESHOLD;
+    if (pctChanged > threshold) {
+      const nodeName = node?.name || nodeId;
+      const now = Date.now();
+
+      // Cooldown: don't start a new clip within 30s of the last one finishing
+      if (node._lastMotionAlert && (now - node._lastMotionAlert) < 30000) return;
+
+      console.log(`[⚠️] Motion detected on ${nodeName}: ${pctChanged.toFixed(1)}% — recording ${CLIP_DURATION_MS / 1000}s clip...`);
+
+      // Start recording clip
+      clipState.set(nodeId, {
+        recording: true,
+        frames: [{ buffer: jpegBuffer, ts: now }],
+        startTs: now,
+        pctChanged,
+        bestFrame: { buffer: jpegBuffer, sharpness: 0 },
+      });
+    }
+  } catch (e) {
+    console.error(`[!] Motion detection error for ${nodeId}:`, e.message);
+  }
+}
+
+async function finalizeClip(nodeId) {
+  const node = nodes.get(nodeId);
+  const clip = clipState.get(nodeId);
+  if (!clip || !node) return;
+
+  const nodeName = node?.name || nodeId;
+  const now = Date.now();
+  node._lastMotionAlert = now;
+
+  const nodeClipDir = path.join(CLIP_DIR, nodeId);
+  fs.mkdirSync(nodeClipDir, { recursive: true });
+
+  const frameCount = clip.frames.length;
+  console.log(`[🎬] Finalizing clip for ${nodeName}: ${frameCount} frames`);
+
+  // Save frames as temp files for ffmpeg
+  const tmpDir = path.join(nodeClipDir, `tmp-${now}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  for (let i = 0; i < clip.frames.length; i++) {
+    const padded = String(i).padStart(5, '0');
+    fs.writeFileSync(path.join(tmpDir, `frame-${padded}.jpg`), clip.frames[i].buffer);
+  }
+
+  // Calculate fps from actual frame timing
+  const duration = (clip.frames[clip.frames.length - 1].ts - clip.frames[0].ts) / 1000;
+  const fps = Math.max(1, Math.round(frameCount / Math.max(0.1, duration)));
+
+  const clipFilename = `motion-${now}.mp4`;
+  const clipPath = path.join(nodeClipDir, clipFilename);
+
+  // Save best frame as thumbnail
+  const thumbPath = path.join(nodeClipDir, `motion-${now}-thumb.jpg`);
+  if (clip.bestFrame?.buffer) {
+    fs.writeFileSync(thumbPath, clip.bestFrame.buffer);
+  }
+
+  // Stitch frames into MP4 with ffmpeg
+  try {
+    await new Promise((resolve, reject) => {
+      execFile('ffmpeg', [
+        '-y', '-framerate', String(fps),
+        '-i', path.join(tmpDir, 'frame-%05d.jpg'),
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-preset', 'ultrafast', '-crf', '28',
+        clipPath,
+      ], { timeout: 15000 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+    console.log(`[🎬] Clip saved: ${clipPath}`);
+  } catch (e) {
+    console.log(`[⚠️] ffmpeg clip failed: ${e.message}`);
+  }
+
+  // Clean up temp frames
+  try {
+    fs.readdirSync(tmpDir).forEach(f => fs.unlinkSync(path.join(tmpDir, f)));
+    fs.rmdirSync(tmpDir);
+  } catch (_) {}
+
+  // --- Phase 2: YOLOv8 Nano person detection (pre-filter before LLaVA) ---
+  let personDetected = false;
+  let yoloResult = null;
+  if (clip.bestFrame?.buffer) {
+    try {
+      const yoloScript = path.join(PROJECT_ROOT, 'detect_person.py');
+      const pythonBin = process.env.PYTHON_BIN || path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
+      yoloResult = await new Promise((resolve, reject) => {
+        execFile(pythonBin, [yoloScript, thumbPath], { timeout: 30000 }, (err, stdout, stderr) => {
+          if (err && err.code === 2) { reject(new Error(stderr || 'YOLO error')); return; }
+          try {
+            const data = JSON.parse(stdout);
+            resolve(data);
+          } catch (_) {
+            resolve({ persons: [], count: 0 });
+          }
+        });
+      });
+      personDetected = yoloResult.count > 0;
+      console.log(`[🔍] YOLO: ${personDetected ? `${yoloResult.count} person(s) detected` : 'no person — skipping LLaVA'}`);
+    } catch (e) {
+      console.log(`[⚠️] YOLO detection failed: ${e.message} — falling back to LLaVA`);
+      personDetected = true; // fail-open: if YOLO fails, still run LLaVA
+    }
+  }
+
+  // Vision analysis on best frame (only if person detected by YOLO)
+  let description = null;
+  if (personDetected && clip.bestFrame?.buffer) {
+    try {
+      const imgBase64 = clip.bestFrame.buffer.toString('base64');
+      const ollamaRes = await fetch('http://localhost:11434/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llava:7b',
+          prompt: 'What is happening in this image? Reply in 5-10 words max. Focus on people and activity only. Example: "Person walking through kitchen" or "Empty room, TV on"',
+          images: [imgBase64],
+          stream: false,
+        }),
+      });
+      if (ollamaRes.ok) {
+        const ollamaData = await ollamaRes.json();
+        description = ollamaData.response?.trim() || null;
+        console.log(`[🧠] Vision: ${description}`);
+      }
+    } catch (e) {
+      console.log(`[⚠️] Vision analysis failed: ${e.message}`);
+    }
+  }
+
+  // Write alert (always log, but mark whether person was detected)
+  const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
+  fs.mkdirSync(alertDir, { recursive: true });
+  const alert = {
+    type: 'motion',
+    nodeId,
+    nodeName,
+    pctChanged: parseFloat(clip.pctChanged.toFixed(1)),
+    frameCount,
+    durationSec: parseFloat(duration.toFixed(1)),
+    clip: clipPath,
+    thumbnail: thumbPath,
+    description,
+    personDetected,
+    personCount: yoloResult?.count || 0,
+    location: node?.location || null,
+    timestamp: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(alertDir, `${now}.json`), JSON.stringify(alert));
+  broadcastToAdmins({ type: 'alert', alert });
+
+  // --- Telegram alert (only when person detected) ---
+  if (personDetected && TELEGRAM_ENABLED) {
+    sendTelegramAlert(alert).catch(e => console.log(`[⚠️] Telegram alert failed: ${e.message}`));
+  }
+
+  // Clear clip state
+  clipState.delete(nodeId);
+}
+
+// ---------- Helpers ----------
+
+function sendCommand(node, type, payload) {
+  if (node.ws && node.ws.readyState === 1) {
+    const msg = JSON.stringify({ type, ...payload });
+    node.bytesOut += Buffer.byteLength(msg);
+    node.ws.send(msg);
+  } else if (node.polling) {
+    if (!node.pendingCommands) node.pendingCommands = [];
+    node.pendingCommands.push({ type, ...payload });
+  }
+}
+
+function waitForResponse(requestId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(requestId);
+      reject(new Error('Request timed out'));
+    }, timeoutMs);
+
+    pending.set(requestId, { resolve, reject, timer });
+  });
+}
+
+function resolvePending(requestId, result, error) {
+  const p = pending.get(requestId);
+  if (!p) return;
+  clearTimeout(p.timer);
+  pending.delete(requestId);
+  if (error) p.reject(error);
+  else p.resolve(result);
+}
+
+// ---------- Start ----------
+// HTTPS on main port (camera/mic require secure context)
+const HTTP_PORT = parseInt(process.env.HTTP_PORT || '3902', 10); // internal HTTP for API calls
+try {
+  const sslOpts = {
+    key: fs.readFileSync(path.join(__dirname, 'certs', 'key.pem')),
+    cert: fs.readFileSync(path.join(__dirname, 'certs', 'cert.pem')),
+  };
+  const httpsServer = createHttpsServer(sslOpts, app);
+  const wssSecure = new WebSocketServer({ server: httpsServer });
+  wssSecure.on('connection', handleWSConnection);
+  httpsServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`🔒 Phone Home hub (HTTPS) listening on port ${PORT}`);
+    console.log(`   Web client: https://<your-ip>:${PORT}/`);
+  });
+} catch (e) {
+  console.log(`⚠️  HTTPS disabled (no certs): ${e.message}`);
+}
+
+// HTTP for local API access (Reef)
+server.listen(HTTP_PORT, '127.0.0.1', () => {
+  console.log(`📡 Phone Home hub (HTTP) listening on port ${HTTP_PORT}`);
+  console.log(`   API:        http://localhost:${HTTP_PORT}/api/nodes`);
+});

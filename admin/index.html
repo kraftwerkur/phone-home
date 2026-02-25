@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="PH Command">
+<meta name="theme-color" content="#0a0a0a">
+<link rel="manifest" href="/manifest-admin.json">
+<link rel="apple-touch-icon" href="/icons/icon-180.png">
+<title>Phone Home — Command</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #0a0a0a;
+  --bg2: #111;
+  --bg3: #1a1a1a;
+  --border: #222;
+  --green: #0f0;
+  --green-dim: #0a0;
+  --amber: #ffa500;
+  --red: #f44;
+  --text: #ccc;
+  --text-dim: #666;
+  --mono: 'SF Mono', 'Fira Code', 'Courier New', monospace;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* --- Layout --- */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.header h1 {
+  font-size: 16px;
+  font-weight: 400;
+  color: var(--green);
+  letter-spacing: 2px;
+}
+.header .ws-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.header .ws-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--red);
+}
+.header .ws-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.tab {
+  padding: 10px 16px;
+  cursor: pointer;
+  color: var(--text-dim);
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: none;
+  border-top: none;
+  border-left: none;
+  border-right: none;
+  transition: color .2s;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--green); border-bottom-color: var(--green); }
+
+.panel { display: none; padding: 16px; }
+.panel.active { display: block; }
+
+/* --- Stats Bar --- */
+.stats-bar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+.stat {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+}
+.stat .label { font-size: 8px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.stat .value { font-size: 16px; color: var(--green); margin-top: 1px; white-space: nowrap; }
+
+/* --- Node Cards --- */
+.nodes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.node-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px;
+  cursor: pointer;
+  transition: border-color .2s;
+}
+.node-card:hover { border-color: var(--green-dim); }
+.node-card.selected { border-color: var(--green); }
+.node-card .node-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.node-card .node-name {
+  font-size: 14px;
+  color: #fff;
+}
+.node-card .node-status {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+}
+.node-status.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.node-status.offline { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.node-card .node-info {
+  font-size: 10px;
+  color: var(--text-dim);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+}
+.node-card .node-controls {
+  margin-top: 10px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* --- Buttons --- */
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg3);
+  color: var(--text);
+  cursor: pointer;
+  transition: all .2s;
+}
+.btn:hover { border-color: var(--green-dim); color: var(--green); }
+.btn:active { background: #222; }
+.btn.active { border-color: var(--green); color: var(--green); }
+.btn.danger { color: var(--red); }
+.btn.danger:hover { border-color: var(--red); }
+
+/* --- Snapshot Preview --- */
+.preview-container {
+  margin-top: 16px;
+  text-align: center;
+}
+.preview-container img {
+  max-width: 100%;
+  max-height: 400px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.preview-container .preview-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 6px;
+}
+
+/* --- Alerts Timeline --- */
+.alerts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.alert-item {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  display: flex;
+  gap: 12px;
+  cursor: pointer;
+  transition: border-color .2s;
+}
+.alert-item:hover { border-color: var(--green-dim); }
+.alert-item.tamper { border-left: 3px solid var(--red); }
+.alert-item.motion { border-left: 3px solid var(--amber); }
+.alert-thumb {
+  width: 80px;
+  height: 60px;
+  border-radius: 3px;
+  object-fit: cover;
+  background: var(--bg3);
+  flex-shrink: 0;
+}
+.alert-details { flex: 1; }
+.alert-details .alert-time {
+  font-size: 11px;
+  color: var(--green);
+}
+.alert-details .alert-node {
+  font-size: 12px;
+  color: #fff;
+  margin: 2px 0;
+}
+.alert-details .alert-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.alert-details .alert-type-badge {
+  display: inline-block;
+  font-size: 9px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.alert-type-badge.motion { background: rgba(255,165,0,.2); color: var(--amber); }
+.alert-type-badge.tamper { background: rgba(255,68,68,.2); color: var(--red); }
+
+/* --- Video Modal --- */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.85);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.modal-overlay.active { display: flex; }
+.modal-content {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+.modal-content video {
+  max-width: 100%;
+  max-height: 70vh;
+  border-radius: 4px;
+}
+.modal-close {
+  float: right;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 20px;
+  background: none;
+  border: none;
+  font-family: var(--mono);
+}
+.modal-close:hover { color: var(--red); }
+
+/* --- Threshold Slider --- */
+.threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.threshold-row input[type=range] {
+  flex: 1;
+  accent-color: var(--green);
+  max-width: 120px;
+}
+.threshold-val {
+  font-size: 11px;
+  color: var(--green);
+  min-width: 30px;
+}
+
+/* --- Listen Controls --- */
+.listen-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.listen-row select {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px;
+}
+
+/* --- Map --- */
+#map {
+  width: 100%;
+  height: 50vh;
+  min-height: 300px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+.leaflet-container { background: #111 !important; }
+.leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.8) contrast(1.2); }
+
+/* --- Empty States --- */
+.empty {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-dim);
+}
+.empty .icon { font-size: 32px; margin-bottom: 8px; }
+
+/* --- Responsive --- */
+@media (max-width: 600px) {
+  .stats-bar { gap: 4px; padding: 8px 10px; }
+  .stat { padding: 4px 6px; }
+  .stat .label { font-size: 7px; }
+  .stat .value { font-size: 14px; }
+  .nodes-grid { grid-template-columns: 1fr; }
+  .alert-item { flex-direction: column; }
+  .alert-thumb { width: 100%; height: 120px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📡 PHONE HOME</h1>
+  <div class="ws-status">
+    <div class="ws-dot" id="wsDot"></div>
+    <span id="wsLabel">disconnected</span>
+  </div>
+</div>
+
+<div class="stats-bar">
+  <div class="stat"><div class="label">Nodes</div><div class="value" id="statNodes">0</div></div>
+  <div class="stat"><div class="label">Alerts Today</div><div class="value" id="statAlerts">0</div></div>
+  <div class="stat"><div class="label">Disk Usage</div><div class="value" id="statDisk">—</div></div>
+  <div class="stat"><div class="label">Uptime</div><div class="value" id="statUptime">—</div></div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-panel="nodes">Nodes</button>
+  <button class="tab" data-panel="alerts">Alerts</button>
+  <button class="tab" data-panel="map">Map</button>
+</div>
+
+<div class="panel active" id="panel-nodes">
+  <div class="nodes-grid" id="nodesGrid"></div>
+  <!-- per-node previews are now inline in each card -->
+</div>
+
+<div class="panel" id="panel-alerts">
+  <div style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">
+    <span style="color:var(--text-dim);font-size:11px" id="alertCount"></span>
+    <button class="btn danger" onclick="clearAlerts()">Clear All</button>
+  </div>
+  <div class="alerts-list" id="alertsList"></div>
+</div>
+
+<div class="panel" id="panel-map">
+  <div id="map"></div>
+</div>
+
+<div class="modal-overlay" id="videoModal">
+  <div class="modal-content">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <video id="modalVideo" controls></video>
+  </div>
+</div>
+
+<script>
+// --- State ---
+let nodesData = [];
+let alertsData = [];
+let ws = null;
+let map = null;
+let markers = {};
+const BASE = location.origin;
+
+// --- Tabs ---
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+    if (tab.dataset.panel === 'map') initMap();
+  });
+});
+
+// --- WebSocket ---
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/?role=admin');
+
+  ws.onopen = () => {
+    document.getElementById('wsDot').classList.add('connected');
+    document.getElementById('wsLabel').textContent = 'live';
+  };
+
+  ws.onclose = () => {
+    document.getElementById('wsDot').classList.remove('connected');
+    document.getElementById('wsLabel').textContent = 'disconnected';
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'node-connected' || msg.type === 'node-disconnected') {
+        refreshNodes();
+      } else if (msg.type === 'alert') {
+        alertsData.unshift(msg.alert);
+        renderAlerts();
+        refreshStats();
+      }
+    } catch {}
+  };
+}
+
+// --- API ---
+async function api(url, opts) {
+  try {
+    const res = await fetch(BASE + url, opts);
+    return await res.json();
+  } catch { return null; }
+}
+
+async function refreshNodes() {
+  nodesData = await api('/api/nodes') || [];
+  // Skip full re-render if live feeds are active — just update stats
+  if (Object.keys(liveIntervals).length > 0) {
+    refreshStats();
+    return;
+  }
+  renderNodes();
+  updateMapMarkers();
+  // Refresh bandwidth charts for all nodes (slight delay for DOM to settle)
+  setTimeout(() => {
+    for (const n of nodesData) {
+      drawBwChart(n.id);
+    }
+  }, 100);
+}
+
+async function refreshAlerts() {
+  alertsData = await api('/api/alerts') || [];
+  alertsData.reverse();
+  renderAlerts();
+}
+
+async function refreshStats() {
+  const stats = await api('/api/stats');
+  if (!stats) return;
+  document.getElementById('statNodes').textContent = stats.nodeCount;
+  document.getElementById('statAlerts').textContent = stats.alertCount;
+  document.getElementById('statDisk').textContent = formatBytes(stats.diskUsage);
+  document.getElementById('statUptime').textContent = formatUptime(stats.uptime);
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+
+function formatUptime(s) {
+  if (s < 60) return Math.floor(s) + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
+}
+
+function formatBytes(b) {
+  if (b < 1024) return b + 'B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + 'MB';
+  return (b / 1073741824).toFixed(1) + 'GB';
+}
+
+function timeAgo(ts) {
+  const diff = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (diff < 10) return 'just now';
+  if (diff < 60) return Math.floor(diff) + 's ago';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+  return Math.floor(diff/86400) + 'd ago';
+}
+
+// --- Render Nodes ---
+function renderNodes() {
+  const grid = document.getElementById('nodesGrid');
+  if (nodesData.length === 0) {
+    grid.innerHTML = '<div class="empty"><div class="icon">📡</div>No nodes connected</div>';
+    return;
+  }
+
+  // Save active live feeds before re-render
+  const activeLives = Object.keys(liveIntervals);
+
+  grid.innerHTML = nodesData.map(n => {
+    const lastHB = n.lastHeartbeat ? timeAgo(new Date(n.lastHeartbeat).toISOString()) : '—';
+    const loc = n.location ? n.location.lat.toFixed(4) + ', ' + n.location.lng.toFixed(4) : '—';
+    const battery = n.battery != null ? n.battery + '%' : 'N/A (iOS)';
+    const threshold = n.motionThreshold || 5;
+
+    return `<div class="node-card" id="card-${n.id}">
+      <div class="node-header">
+        <span class="node-name">${esc(n.name || 'Unnamed')}</span>
+        <div class="node-status online"></div>
+      </div>
+      <div class="node-info">
+        <span>🔋 ${battery}</span>
+        <span>📍 ${loc}</span>
+        <span>⏱ ${lastHB}</span>
+        <span>📊 ↓${formatBytes(n.bytesIn || 0)} ↑${formatBytes(n.bytesOut || 0)}</span>
+        ${n.deviceInfo ? `<span>📱 iOS ${esc(n.deviceInfo.iosVersion||'?')}</span>` : n.userAgent && n.userAgent.includes('iPhone') ? `<span>📱 iPhone</span>` : ''}
+      </div>
+      <div class="node-preview" id="preview-${n.id}">
+        <img id="img-${n.id}" src="${BASE}/api/snapshots/${n.id}/latest?${Date.now()}" alt="" onerror="this.style.display='none'" style="width:100%;border-radius:4px;border:1px solid var(--border);margin-top:8px;">
+        <div id="preview-label-${n.id}" style="font-size:10px;color:var(--text-dim);margin-top:4px;"></div>
+      </div>
+      <div class="node-controls">
+        <button class="btn ${n.motionEnabled ? 'active' : ''}" onclick="toggleMotion('${n.id}', ${!n.motionEnabled})">
+          ${n.motionEnabled ? '👁 Motion ON' : '👁 Motion OFF'}
+        </button>
+        <button class="btn" onclick="snapNode('${n.id}')">📸 Snap</button>
+        <button class="btn" id="live-btn-${n.id}" onclick="toggleLive('${n.id}')">📹 Live</button>
+        <select onchange="setQuality('${n.id}', this.value)" style="background:#111;color:#0f0;border:1px solid #333;padding:4px;border-radius:4px;font-size:0.8em;">
+          <option value="low" ${n.quality==='low'?'selected':''}>Low</option>
+          <option value="medium" ${!n.quality||n.quality==='medium'?'selected':''}>Med</option>
+          <option value="high" ${n.quality==='high'?'selected':''}>High</option>
+        </select>
+        <div class="listen-row">
+          <button class="btn" onclick="listenNode('${n.id}')">🎤 Listen</button>
+          <select id="dur-${n.id}">
+            <option value="3">3s</option>
+            <option value="5" selected>5s</option>
+            <option value="10">10s</option>
+            <option value="30">30s</option>
+          </select>
+        </div>
+      </div>
+      <div class="threshold-row">
+        <span style="font-size:11px;color:var(--text-dim)">Sensitivity:</span>
+        <input type="range" min="1" max="30" value="${threshold}" oninput="this.nextElementSibling.textContent=this.value+'%'" onchange="setThreshold('${n.id}', this.value)">
+        <span class="threshold-val">${threshold}%</span>
+      </div>
+      <div style="margin-top:8px;">
+        <div style="color:#444; font-size:0.65em;">BANDWIDTH — <span style="color:#0f0;">↓in</span> <span style="color:#0aa;">↑out</span></div>
+        <canvas id="bw-${n.id}" width="360" height="100" style="width:100%; min-height:80px; background:#0a0a0a; border-radius:4px; border:1px solid #1a1a1a; margin-top:4px;"></canvas>
+        <div id="bwstat-${n.id}" style="color:#555; font-size:0.6em; margin-top:2px;"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Restore active live feeds after DOM rebuild
+  activeLives.forEach(function(id) {
+    clearInterval(liveIntervals[id]);
+    delete liveIntervals[id];
+    toggleLive(id);
+  });
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function guessModel(di) {
+  if (!di) return 'Unknown';
+  const k = di.screenW + 'x' + di.screenH + '@' + di.pixelRatio;
+  const map = {
+    '320x480@2': 'iPhone 4s',
+    '320x568@2': 'iPhone 5s',
+    '375x667@2': 'iPhone 8',
+    '414x736@3': 'iPhone 8+',
+    '375x812@3': 'iPhone X',
+    '414x896@2': 'iPhone XR',
+    '414x896@3': 'iPhone XS Max',
+    '375x812@2': 'iPhone 12 mini',
+    '390x844@3': 'iPhone 13',
+    '428x926@3': 'iPhone 13 Pro Max',
+    '393x852@3': 'iPhone 15',
+    '430x932@3': 'iPhone 15 Pro Max',
+    '402x874@3': 'iPhone 16 Pro',
+    '440x956@3': 'iPhone 16 Pro Max',
+  };
+  return map[k] || ('iPhone ' + di.screenW + '×' + di.screenH + '@' + di.pixelRatio + 'x');
+}
+
+// --- Node Actions ---
+async function toggleMotion(id, enabled) {
+  await api('/api/nodes/' + id + '/motion', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ enabled })
+  });
+  refreshNodes();
+}
+
+async function setQuality(id, quality) {
+  await api('/api/nodes/' + id + '/quality', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quality })
+  });
+}
+
+async function snapNode(id) {
+  const btn = event.target;
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  await api('/api/nodes/' + id + '/snap', { method: 'POST' });
+  // Wait a moment for snap to arrive
+  await new Promise(r => setTimeout(r, 1500));
+  btn.textContent = '📸 Snap';
+  btn.disabled = false;
+  const img = document.getElementById('img-' + id);
+  if (img) { img.style.display = ''; img.src = BASE + '/api/snapshots/' + id + '/latest?' + Date.now(); }
+  const label = document.getElementById('preview-label-' + id);
+  if (label) label.textContent = '📸 ' + new Date().toLocaleTimeString();
+}
+
+// Track live intervals per node
+let liveIntervals = {};
+let bwChartInterval = null;
+
+async function drawBwChart(nodeId, canvasId) {
+  try {
+    const rates = await api('/api/nodes/' + nodeId + '/bandwidth');
+    const cid = canvasId || ('bw-' + nodeId);
+    const canvas = document.getElementById(cid);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+    const pad = { t: 10, b: 20, l: 45, r: 10 };
+    const gW = W - pad.l - pad.r;
+    const gH = H - pad.t - pad.b;
+
+    ctx.clearRect(0, 0, W, H);
+
+    if (!rates || rates.length < 2) {
+      ctx.fillStyle = '#333';
+      ctx.font = '12px monospace';
+      ctx.fillText('Collecting data...', W/2 - 50, H/2);
+      return;
+    }
+
+    // Find max rate for scaling
+    let maxRate = 0;
+    for (const r of rates) {
+      if (r.inRate > maxRate) maxRate = r.inRate;
+      if (r.outRate > maxRate) maxRate = r.outRate;
+    }
+    maxRate = Math.max(maxRate, 100); // minimum scale
+
+    // Grid lines
+    ctx.strokeStyle = '#1a1a1a';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + (gH / 4) * i;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+      ctx.fillStyle = '#444';
+      ctx.font = '9px monospace';
+      const val = maxRate - (maxRate / 4) * i;
+      ctx.fillText(formatBytesChart(val) + '/s', 2, y + 3);
+    }
+
+    // Time labels
+    ctx.fillStyle = '#333';
+    ctx.font = '9px monospace';
+    const firstTs = rates[0].ts;
+    const lastTs = rates[rates.length - 1].ts;
+    ctx.fillText('-' + Math.round((lastTs - firstTs) / 60000) + 'm', pad.l, H - 2);
+    ctx.fillText('now', W - pad.r - 20, H - 2);
+
+    // Draw inRate line (green)
+    ctx.strokeStyle = '#0f0';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < rates.length; i++) {
+      const x = pad.l + (i / (rates.length - 1)) * gW;
+      const y = pad.t + gH - (rates[i].inRate / maxRate) * gH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Fill under inRate
+    ctx.fillStyle = 'rgba(0, 255, 0, 0.05)';
+    ctx.lineTo(pad.l + gW, pad.t + gH);
+    ctx.lineTo(pad.l, pad.t + gH);
+    ctx.closePath();
+    ctx.fill();
+
+    // Draw outRate line (cyan)
+    ctx.strokeStyle = '#0aa';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < rates.length; i++) {
+      const x = pad.l + (i / (rates.length - 1)) * gW;
+      const y = pad.t + gH - (rates[i].outRate / maxRate) * gH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Stats
+    const lastRate = rates[rates.length - 1];
+    const totalIn = rates.reduce((s, r) => s + r.inRate * 10, 0); // approx total over period
+    const totalOut = rates.reduce((s, r) => s + r.outRate * 10, 0);
+    const statsEl = document.getElementById('bwstat-' + nodeId) || document.getElementById('bwStats');
+    if (statsEl) statsEl.textContent = 
+      'Now: ↓' + formatBytesChart(lastRate.inRate) + '/s ↑' + formatBytesChart(lastRate.outRate) + '/s' +
+      ' | Total: ↓' + formatBytesChart(totalIn) + ' ↑' + formatBytesChart(totalOut);
+  } catch(e) {}
+}
+
+function formatBytesChart(b) {
+  if (b < 1024) return Math.round(b) + 'B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
+  return (b / 1048576).toFixed(1) + 'MB';
+}
+
+function toggleLive(id) {
+  const img = document.getElementById('img-' + id);
+  const label = document.getElementById('preview-label-' + id);
+  const btn = document.getElementById('live-btn-' + id);
+
+  if (liveIntervals[id]) {
+    clearInterval(liveIntervals[id]);
+    delete liveIntervals[id];
+    if (label) label.textContent = '';
+    if (btn) { btn.textContent = '📹 Live'; btn.classList.remove('active'); }
+    return;
+  }
+
+  const node = nodesData.find(n => n.id === id);
+  const nodeName = node ? node.name : id;
+  if (btn) { btn.textContent = '⏹ Stop'; btn.classList.add('active'); }
+
+  async function refreshLive() {
+    try {
+      await fetch(BASE + '/api/nodes/' + id + '/snap', { method: 'POST' });
+      await new Promise(r => setTimeout(r, 800));
+      if (img) { img.style.display = ''; img.src = BASE + '/api/snapshots/' + id + '/latest?' + Date.now(); }
+      if (label) label.textContent = '🔴 LIVE — ' + new Date().toLocaleTimeString();
+    } catch(e) {}
+  }
+
+  refreshLive();
+  liveIntervals[id] = setInterval(refreshLive, 2000);
+}
+
+async function listenNode(id) {
+  const dur = document.getElementById('dur-' + id);
+  const duration = dur ? parseInt(dur.value) : 5;
+  const btn = event.target;
+  btn.textContent = '⏳';
+  btn.disabled = true;
+  await api('/api/nodes/' + id + '/listen', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ duration })
+  });
+  btn.textContent = '🎤 Listen';
+  btn.disabled = false;
+}
+
+async function setThreshold(id, val) {
+  await api('/api/nodes/' + id + '/threshold', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ threshold: parseFloat(val) })
+  });
+}
+
+// --- Render Alerts ---
+function renderAlerts() {
+  const list = document.getElementById('alertsList');
+  const count = document.getElementById('alertCount');
+  count.textContent = alertsData.length + ' alert' + (alertsData.length !== 1 ? 's' : '');
+
+  if (alertsData.length === 0) {
+    list.innerHTML = '<div class="empty"><div class="icon">✅</div>No alerts</div>';
+    return;
+  }
+
+  list.innerHTML = alertsData.map((a, i) => {
+    const isMotion = a.type === 'motion';
+    const isTamper = a.type === 'tamper';
+    const time = new Date(a.timestamp).toLocaleString();
+    const thumbUrl = isMotion && a.thumbnail ? getThumbnailUrl(a) : '';
+    const clipUrl = isMotion && a.clip ? getClipUrl(a) : '';
+
+    return `<div class="alert-item ${a.type}" ${clipUrl ? 'onclick="playClip(\''+esc(clipUrl)+'\')"' : ''}>
+      ${thumbUrl ? '<img class="alert-thumb" src="'+esc(thumbUrl)+'" onerror="this.style.display=\'none\'">' : ''}
+      <div class="alert-details">
+        <div class="alert-time">${time}</div>
+        <div class="alert-node">
+          ${esc(a.nodeName || a.nodeId)}
+          <span class="alert-type-badge ${a.type}">${a.type}</span>
+        </div>
+        <div class="alert-desc">
+          ${isMotion ? (a.description || a.pctChanged + '% motion — ' + (a.frameCount||0) + ' frames') : ''}
+          ${isTamper ? 'Acceleration delta: ' + (a.delta||0).toFixed(1) + ' m/s²' : ''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function getThumbnailUrl(alert) {
+  if (!alert.thumbnail) return '';
+  // Extract nodeId and filename from path
+  const parts = alert.thumbnail.split('/');
+  const filename = parts[parts.length - 1];
+  return BASE + '/api/thumbs/' + alert.nodeId + '/' + filename;
+}
+
+function getClipUrl(alert) {
+  if (!alert.clip) return '';
+  const parts = alert.clip.split('/');
+  const filename = parts[parts.length - 1];
+  return BASE + '/api/clips/' + alert.nodeId + '/' + filename;
+}
+
+async function clearAlerts() {
+  await api('/api/alerts', { method: 'DELETE' });
+  alertsData = [];
+  renderAlerts();
+  refreshStats();
+}
+
+// --- Video Modal ---
+function playClip(url) {
+  const video = document.getElementById('modalVideo');
+  video.src = url;
+  document.getElementById('videoModal').classList.add('active');
+  video.play().catch(() => {});
+}
+
+function closeModal() {
+  const video = document.getElementById('modalVideo');
+  video.pause();
+  video.src = '';
+  document.getElementById('videoModal').classList.remove('active');
+}
+
+document.getElementById('videoModal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+// --- Map ---
+function initMap() {
+  if (map) { map.invalidateSize(); updateMapMarkers(); return; }
+  map = L.map('map').setView([40, -74], 4);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OSM',
+    maxZoom: 19,
+  }).addTo(map);
+  updateMapMarkers();
+}
+
+function updateMapMarkers() {
+  if (!map) return;
+  // Remove old markers
+  Object.values(markers).forEach(m => map.removeLayer(m));
+  markers = {};
+
+  const withLoc = nodesData.filter(n => n.location);
+  if (withLoc.length === 0) return;
+
+  const bounds = [];
+  withLoc.forEach(n => {
+    const lat = n.location.lat;
+    const lng = n.location.lng;
+    bounds.push([lat, lng]);
+
+    const color = '#0f0'; // all online since they're in the list
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="width:14px;height:14px;border-radius:50%;background:${color};border:2px solid #fff;box-shadow:0 0 8px ${color}"></div>`,
+      iconSize: [14, 14],
+      iconAnchor: [7, 7],
+    });
+
+    const marker = L.marker([lat, lng], { icon }).addTo(map);
+    marker.bindPopup(`<b style="color:#000">${esc(n.name||'Unnamed')}</b><br>🔋 ${n.battery != null ? n.battery+'%' : '—'}<br>📍 ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+    markers[n.id] = marker;
+  });
+
+  if (bounds.length > 0) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
+}
+
+// --- Init ---
+connectWS();
+refreshNodes();
+refreshAlerts();
+refreshStats();
+
+// Poll every 15s
+setInterval(() => { refreshNodes(); refreshStats(); }, 15000);
+// Alerts every 30s
+setInterval(refreshAlerts, 30000);
+</script>
+</body>
+</html>
