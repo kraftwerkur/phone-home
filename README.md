@@ -127,9 +127,14 @@ Real-time node monitoring with bandwidth graphs, per-node controls, motion sensi
 ![Admin Dashboard](screenshots/admin-dashboard.png)
 
 ### Camera Node (Client)
-The web client served to each iPhone — name the node and connect to start streaming.
+The web client served to each iPhone — name the node and connect to start streaming. Install as a PWA for fullscreen, always-on operation.
 
 ![Client Connect](screenshots/client-connect.png)
+
+### Camera Node — Connected
+Once connected, the node streams frames to the hub. Shows connection status, battery level, camera feed, and activity log.
+
+![Client Connected](screenshots/client-connected.png)
 
 ## The Polling Fallback Story
 
