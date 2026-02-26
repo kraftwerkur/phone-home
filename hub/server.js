@@ -105,6 +105,7 @@ const MOTION_THRESHOLD = 5;        // percent of pixels changed to trigger motio
 const MOTION_PIXEL_DIFF = 30;      // per-channel difference to count as "changed"
 const CLIP_DURATION_MS = 5000;     // record 5 seconds of video on motion
 const CLIP_DIR = path.join(PROJECT_ROOT, 'data', 'clips');
+const TIMELAPSE_DIR = path.join(PROJECT_ROOT, 'data', 'timelapse');
 
 // Bandwidth history: per-node samples every 10s for last 30min (180 samples)
 const bwHistory = new Map(); // nodeId → [{ ts, bytesIn, bytesOut }]
@@ -124,6 +125,7 @@ setInterval(() => {
 fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 fs.mkdirSync(CLIP_DIR, { recursive: true });
+fs.mkdirSync(TIMELAPSE_DIR, { recursive: true });
 
 // ---------- Disk Cleanup (every 6 hours, delete files older than 7 days) ----------
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -163,6 +165,115 @@ function cleanupOldFiles() {
 // Run on startup + every 6 hours
 cleanupOldFiles();
 setInterval(cleanupOldFiles, CLEANUP_INTERVAL_MS);
+
+// ---------- Timelapse ----------
+const timelapseIntervals = new Map(); // nodeId → intervalId
+
+function getNodeTimelapseConfig(node) {
+  return node.timelapse || {
+    intervalMinutes: 15,
+    activeHoursStart: 6,
+    activeHoursEnd: 19,
+    timezone: 'America/New_York',
+  };
+}
+
+function isWithinActiveHours(config) {
+  const tz = config.timezone || 'America/New_York';
+  const now = new Date();
+  // Get current hour in the configured timezone
+  const hourStr = now.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false });
+  const hour = parseInt(hourStr, 10);
+  return hour >= config.activeHoursStart && hour < config.activeHoursEnd;
+}
+
+function startTimelapseInterval(nodeId) {
+  stopTimelapseInterval(nodeId);
+  const node = nodes.get(nodeId);
+  if (!node || node.mode !== 'timelapse') return;
+
+  const config = getNodeTimelapseConfig(node);
+  const intervalMs = (config.intervalMinutes || 15) * 60 * 1000;
+
+  console.log(`[⏱] Timelapse started for ${node.name || nodeId}: every ${config.intervalMinutes}min, ${config.activeHoursStart}:00-${config.activeHoursEnd}:00 ${config.timezone}`);
+
+  const doSnap = () => {
+    const n = nodes.get(nodeId);
+    if (!n || n.mode !== 'timelapse') { stopTimelapseInterval(nodeId); return; }
+    const cfg = getNodeTimelapseConfig(n);
+    if (!isWithinActiveHours(cfg)) {
+      console.log(`[⏱] Timelapse skip for ${n.name || nodeId}: outside active hours`);
+      return;
+    }
+    // Tag this snap as timelapse so the binary handler saves it correctly
+    n._pendingTimelapseSnap = true;
+    sendCommand(n, 'snap', {});
+    console.log(`[⏱] Timelapse snap requested for ${n.name || nodeId}`);
+  };
+
+  // Take first snap immediately if within active hours
+  doSnap();
+  const id = setInterval(doSnap, intervalMs);
+  timelapseIntervals.set(nodeId, id);
+}
+
+function stopTimelapseInterval(nodeId) {
+  if (timelapseIntervals.has(nodeId)) {
+    clearInterval(timelapseIntervals.get(nodeId));
+    timelapseIntervals.delete(nodeId);
+    console.log(`[⏱] Timelapse stopped for ${nodeId}`);
+  }
+}
+
+async function saveTimelapseFrame(nodeId, buffer) {
+  const nodeDir = path.join(TIMELAPSE_DIR, nodeId);
+  fs.mkdirSync(nodeDir, { recursive: true });
+
+  const node = nodes.get(nodeId);
+  const tz = node?.timelapse?.timezone || 'America/New_York';
+  const now = new Date();
+  // Format: YYYY-MM-DD-HHmm.jpg
+  const parts = now.toLocaleString('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).replace(/\//g, '-').replace(/,\s*/, '-').replace(':', '');
+  // Parse to get clean format
+  const y = now.toLocaleString('en-US', { timeZone: tz, year: 'numeric' });
+  const m = now.toLocaleString('en-US', { timeZone: tz, month: '2-digit' });
+  const d = now.toLocaleString('en-US', { timeZone: tz, day: '2-digit' });
+  const h = now.toLocaleString('en-US', { timeZone: tz, hour: '2-digit', hour12: false });
+  const min = now.toLocaleString('en-US', { timeZone: tz, minute: '2-digit' });
+  const filename = `${y}-${m}-${d}-${h.padStart(2,'0')}${min.padStart(2,'0')}.jpg`;
+
+  const filepath = path.join(nodeDir, filename);
+  await fs.promises.writeFile(filepath, buffer);
+  console.log(`[⏱] Timelapse frame saved: ${filepath} (${buffer.length} bytes)`);
+}
+
+function getTimelapseStats(nodeId) {
+  const nodeDir = path.join(TIMELAPSE_DIR, nodeId);
+  if (!fs.existsSync(nodeDir)) return { frames: 0, storageBytes: 0, firstFrame: null, lastFrame: null, videoExists: false, videoSize: 0 };
+
+  const files = fs.readdirSync(nodeDir).filter(f => f.endsWith('.jpg')).sort();
+  let storageBytes = 0;
+  for (const f of files) {
+    try { storageBytes += fs.statSync(path.join(nodeDir, f)).size; } catch {}
+  }
+
+  const videoPath = path.join(nodeDir, 'timelapse.mp4');
+  const videoExists = fs.existsSync(videoPath);
+  let videoSize = 0;
+  if (videoExists) try { videoSize = fs.statSync(videoPath).size; } catch {}
+
+  return {
+    frames: files.length,
+    storageBytes,
+    firstFrame: files.length > 0 ? files[0].replace('.jpg', '') : null,
+    lastFrame: files.length > 0 ? files[files.length - 1].replace('.jpg', '') : null,
+    videoExists,
+    videoSize,
+  };
+}
 
 // ---------- YOLO Server Process ----------
 const yoloScript = path.join(PROJECT_ROOT, 'detect_person.py');
@@ -277,6 +388,8 @@ const ADMIN_ROUTES = [
   { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/quality$/ },
   { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/threshold$/ },
   { method: 'DELETE', pattern: /^\/api\/alerts$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/mode$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/timelapse\/generate$/ },
 ];
 
 app.use('/api', (req, res, next) => {
@@ -382,6 +495,8 @@ app.get('/api/nodes', (_req, res) => {
       quality: node.quality || 'medium',
       userAgent: node.userAgent,
       deviceInfo: node.deviceInfo,
+      mode: node.mode || 'motion',
+      timelapse: node.timelapse || null,
     });
   }
   res.json(list);
@@ -564,6 +679,93 @@ app.post('/api/nodes/:id/motion', (req, res) => {
   res.json({ motionEnabled: node.motionEnabled });
 });
 
+// --- Timelapse API ---
+
+// Set node mode (motion/timelapse) and timelapse config
+app.post('/api/nodes/:id/mode', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  const mode = req.body.mode;
+  if (!['motion', 'timelapse'].includes(mode)) return res.status(400).json({ error: 'Invalid mode: motion or timelapse' });
+
+  const prevMode = node.mode || 'motion';
+  node.mode = mode;
+
+  if (mode === 'timelapse') {
+    // Update timelapse config if provided
+    node.timelapse = {
+      intervalMinutes: req.body.intervalMinutes || node.timelapse?.intervalMinutes || 15,
+      activeHoursStart: req.body.activeHoursStart ?? node.timelapse?.activeHoursStart ?? 6,
+      activeHoursEnd: req.body.activeHoursEnd ?? node.timelapse?.activeHoursEnd ?? 19,
+      timezone: req.body.timezone || node.timelapse?.timezone || 'America/New_York',
+    };
+    // Stop motion streaming if it was on
+    if (node.motionEnabled) {
+      node.motionEnabled = false;
+      sendCommand(node, 'stop-stream', {});
+      prevFrames.delete(req.params.id);
+    }
+    startTimelapseInterval(req.params.id);
+  } else {
+    // Switching back to motion
+    stopTimelapseInterval(req.params.id);
+  }
+
+  console.log(`[⚙️] Node ${node.name || req.params.id} mode: ${prevMode} → ${mode}`);
+  res.json({ mode: node.mode, timelapse: node.timelapse || null });
+});
+
+// Get timelapse stats
+app.get('/api/nodes/:id/timelapse/stats', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+  const stats = getTimelapseStats(req.params.id);
+  res.json(stats);
+});
+
+// Generate timelapse video
+app.post('/api/nodes/:id/timelapse/generate', (req, res) => {
+  const node = nodes.get(req.params.id);
+  if (!node) return res.status(404).json({ error: 'Node not found' });
+
+  const nodeDir = path.join(TIMELAPSE_DIR, req.params.id);
+  if (!fs.existsSync(nodeDir)) return res.status(404).json({ error: 'No timelapse frames' });
+
+  const files = fs.readdirSync(nodeDir).filter(f => f.endsWith('.jpg')).sort();
+  if (files.length === 0) return res.status(404).json({ error: 'No timelapse frames' });
+
+  const outputPath = path.join(nodeDir, 'timelapse.mp4');
+  const framerate = req.body.framerate || 30;
+
+  console.log(`[🎬] Generating timelapse video for ${node.name || req.params.id}: ${files.length} frames @ ${framerate}fps`);
+
+  // Run ffmpeg in background
+  const ffmpeg = execFile('ffmpeg', [
+    '-y', '-framerate', String(framerate),
+    '-pattern_type', 'glob', '-i', path.join(nodeDir, '*.jpg'),
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+    '-preset', 'medium', '-crf', '23',
+    outputPath,
+  ], { timeout: 300000 }, (err) => {
+    if (err) {
+      console.log(`[⚠️] Timelapse ffmpeg failed: ${err.message}`);
+    } else {
+      console.log(`[🎬] Timelapse video generated: ${outputPath}`);
+      broadcastToAdmins({ type: 'timelapse-ready', nodeId: req.params.id });
+    }
+  });
+
+  res.json({ status: 'generating', frames: files.length, framerate });
+});
+
+// Serve timelapse video
+app.get('/api/nodes/:id/timelapse/video', (req, res) => {
+  const videoPath = path.join(TIMELAPSE_DIR, req.params.id, 'timelapse.mp4');
+  if (!fs.existsSync(videoPath)) return res.status(404).json({ error: 'No timelapse video generated yet' });
+  res.sendFile(path.resolve(videoPath));
+});
+
 // ---------- HTTP + WS Server ----------
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -635,6 +837,7 @@ function handleWSConnection(ws, req) {
     prevFrames.delete(id);
     bwHistory.delete(id);
     clipState.delete(id);
+    stopTimelapseInterval(id);
   });
 
   ws.on('error', (err) => {
@@ -728,6 +931,17 @@ async function handleBinaryMessage(nodeId, data) {
 
   const buffer = Buffer.from(data);
 
+  // Check if this is a timelapse snap
+  if (node._pendingTimelapseSnap) {
+    node._pendingTimelapseSnap = false;
+    await saveTimelapseFrame(nodeId, buffer);
+    // Also save as latest snapshot for preview
+    const nodeDir = path.join(SNAPSHOT_DIR, nodeId);
+    fs.mkdirSync(nodeDir, { recursive: true });
+    await fs.promises.writeFile(path.join(nodeDir, 'latest.jpg'), buffer);
+    return;
+  }
+
   // Check if this is a snap response
   if (node._pendingSnapRequestId) {
     const requestId = node._pendingSnapRequestId;
@@ -796,6 +1010,9 @@ async function checkMotion(nodeId, jpegBuffer) {
   try {
     const node = nodes.get(nodeId);
     if (!node) return;
+
+    // Skip motion detection for timelapse nodes
+    if (node.mode === 'timelapse') return;
 
     // If currently recording a clip, just collect frames
     const clip = clipState.get(nodeId);

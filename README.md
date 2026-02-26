@@ -138,6 +138,43 @@ All endpoints are on the HTTP port (default 3902).
 | `/api/clips/:nodeId/:filename` | GET | Serve a clip video |
 | `/api/thumbs/:nodeId/:filename` | GET | Serve an alert thumbnail |
 
+## Timelapse Mode
+
+Each node can be switched to **timelapse mode** for long-term scheduled captures (e.g. pointing a phone at a construction site for months).
+
+### How It Works
+
+1. Set a node to timelapse mode via the admin dashboard or API
+2. The server requests a snapshot on a configurable interval (default: every 15 minutes)
+3. Frames are saved to `data/timelapse/{nodeId}/YYYY-MM-DD-HHmm.jpg`
+4. Capture only happens during active hours (default: 6 AM – 7 PM) to skip nighttime
+5. When ready, stitch all frames into an MP4 timelapse video via ffmpeg
+
+### Per-Node Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `intervalMinutes` | 15 | Snapshot interval in minutes |
+| `activeHoursStart` | 6 | Start capturing at this hour (24h) |
+| `activeHoursEnd` | 19 | Stop capturing at this hour (24h) |
+| `timezone` | America/New_York | Timezone for active hours |
+
+### Timelapse API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/nodes/:id/mode` | POST | Set mode (`{mode: "timelapse"}` or `{mode: "motion"}`) with optional timelapse config |
+| `/api/nodes/:id/timelapse/stats` | GET | Frame count, storage, date range, video status |
+| `/api/nodes/:id/timelapse/generate` | POST | Kick off ffmpeg video generation (non-blocking) |
+| `/api/nodes/:id/timelapse/video` | GET | Download the generated MP4 |
+
+### Admin Dashboard
+
+- Toggle between Motion and Timelapse mode per node
+- Configure interval and active hours inline
+- View frame count, storage usage, and date range
+- Generate and download timelapse videos
+
 ## Screenshots
 
 <!-- TODO: Add screenshots of the web client, admin dashboard, and Telegram alerts -->
@@ -173,7 +210,8 @@ phone-home/
     ├── snapshots/
     ├── clips/
     ├── audio/
-    └── alerts/
+    ├── alerts/
+    └── timelapse/     # Per-node timelapse frames + generated videos
 ```
 
 ## License

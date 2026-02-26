@@ -510,6 +510,8 @@ function connectWS() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'node-connected' || msg.type === 'node-disconnected') {
         refreshNodes();
+      } else if (msg.type === 'timelapse-ready') {
+        loadTimelapseStats(msg.nodeId);
       } else if (msg.type === 'alert') {
         alertsData.unshift(msg.alert);
         renderAlerts();
@@ -538,10 +540,11 @@ async function refreshNodes() {
   }
   renderNodes();
   updateMapMarkers();
-  // Refresh bandwidth charts for all nodes (slight delay for DOM to settle)
+  // Refresh bandwidth charts and timelapse stats for all nodes
   setTimeout(() => {
     for (const n of nodesData) {
       drawBwChart(n.id);
+      if (n.mode === 'timelapse') loadTimelapseStats(n.id);
     }
   }, 100);
 }
@@ -618,9 +621,9 @@ function renderNodes() {
         <div id="preview-label-${n.id}" style="font-size:10px;color:var(--text-dim);margin-top:4px;"></div>
       </div>
       <div class="node-controls">
-        <button class="btn ${n.motionEnabled ? 'active' : ''}" onclick="toggleMotion('${n.id}', ${!n.motionEnabled})">
+        ${(n.mode||'motion')==='motion' ? `<button class="btn ${n.motionEnabled ? 'active' : ''}" onclick="toggleMotion('${n.id}', ${!n.motionEnabled})">
           ${n.motionEnabled ? '👁 Motion ON' : '👁 Motion OFF'}
-        </button>
+        </button>` : ''}
         <button class="btn" onclick="snapNode('${n.id}')">📸 Snap</button>
         <button class="btn" id="live-btn-${n.id}" onclick="toggleLive('${n.id}')">📹 Live</button>
         <select onchange="setQuality('${n.id}', this.value)" style="background:#111;color:#0f0;border:1px solid #333;padding:4px;border-radius:4px;font-size:0.8em;">
@@ -638,11 +641,39 @@ function renderNodes() {
           </select>
         </div>
       </div>
+      <div style="margin-top:8px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:11px;color:var(--text-dim)">Mode:</span>
+        <button class="btn ${(n.mode||'motion')==='motion'?'active':''}" onclick="setNodeMode('${n.id}','motion')" style="font-size:10px;">👁 Motion</button>
+        <button class="btn ${n.mode==='timelapse'?'active':''}" onclick="setNodeMode('${n.id}','timelapse')" style="font-size:10px;">⏱ Timelapse</button>
+      </div>
+      ${(n.mode||'motion')==='motion' ? `
       <div class="threshold-row">
         <span style="font-size:11px;color:var(--text-dim)">Sensitivity:</span>
         <input type="range" min="1" max="30" value="${threshold}" oninput="this.nextElementSibling.textContent=this.value+'%'" onchange="setThreshold('${n.id}', this.value)">
         <span class="threshold-val">${threshold}%</span>
-      </div>
+      </div>` : `
+      <div id="tl-config-${n.id}" style="margin-top:8px;background:#0a0a0a;border:1px solid #1a1a1a;border-radius:4px;padding:10px;font-size:11px;">
+        <div style="color:var(--green);margin-bottom:6px;">⏱ TIMELAPSE CONFIG</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;">
+          <label style="color:var(--text-dim)">Interval (min):</label>
+          <input type="number" id="tl-interval-${n.id}" value="${n.timelapse?.intervalMinutes||15}" min="1" max="1440"
+            onchange="updateTimelapseConfig('${n.id}')"
+            style="background:#111;color:#0f0;border:1px solid #333;padding:2px 6px;border-radius:3px;width:60px;font-family:var(--mono);font-size:11px;">
+          <label style="color:var(--text-dim)">Start hour:</label>
+          <input type="number" id="tl-start-${n.id}" value="${n.timelapse?.activeHoursStart??6}" min="0" max="23"
+            onchange="updateTimelapseConfig('${n.id}')"
+            style="background:#111;color:#0f0;border:1px solid #333;padding:2px 6px;border-radius:3px;width:60px;font-family:var(--mono);font-size:11px;">
+          <label style="color:var(--text-dim)">End hour:</label>
+          <input type="number" id="tl-end-${n.id}" value="${n.timelapse?.activeHoursEnd??19}" min="0" max="23"
+            onchange="updateTimelapseConfig('${n.id}')"
+            style="background:#111;color:#0f0;border:1px solid #333;padding:2px 6px;border-radius:3px;width:60px;font-family:var(--mono);font-size:11px;">
+        </div>
+        <div id="tl-stats-${n.id}" style="margin-top:8px;color:var(--text-dim);font-size:10px;">Loading stats...</div>
+        <div style="margin-top:8px;display:flex;gap:6px;">
+          <button class="btn" onclick="generateTimelapse('${n.id}')">🎬 Generate Video</button>
+          <a id="tl-dl-${n.id}" class="btn" style="display:none;text-decoration:none;" target="_blank">📥 Download</a>
+        </div>
+      </div>`}
       <div style="margin-top:8px;">
         <div style="color:#444; font-size:0.65em;">BANDWIDTH — <span style="color:#0f0;">↓in</span> <span style="color:#0aa;">↑out</span></div>
         <canvas id="bw-${n.id}" width="360" height="100" style="width:100%; min-height:80px; background:#0a0a0a; border-radius:4px; border:1px solid #1a1a1a; margin-top:4px;"></canvas>
@@ -967,6 +998,67 @@ function updateMapMarkers() {
   });
 
   if (bounds.length > 0) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
+}
+
+// --- Timelapse ---
+async function setNodeMode(id, mode) {
+  await api('/api/nodes/' + id + '/mode', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ mode })
+  });
+  refreshNodes();
+}
+
+async function updateTimelapseConfig(id) {
+  const interval = parseInt(document.getElementById('tl-interval-' + id)?.value) || 15;
+  const start = parseInt(document.getElementById('tl-start-' + id)?.value) ?? 6;
+  const end = parseInt(document.getElementById('tl-end-' + id)?.value) ?? 19;
+  await api('/api/nodes/' + id + '/mode', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ mode: 'timelapse', intervalMinutes: interval, activeHoursStart: start, activeHoursEnd: end })
+  });
+}
+
+async function loadTimelapseStats(id) {
+  const stats = await api('/api/nodes/' + id + '/timelapse/stats');
+  if (!stats) return;
+  const el = document.getElementById('tl-stats-' + id);
+  if (el) {
+    el.innerHTML = `📸 ${stats.frames} frames | 💾 ${formatBytes(stats.storageBytes)}` +
+      (stats.firstFrame ? ` | 📅 ${stats.firstFrame} → ${stats.lastFrame}` : '') +
+      (stats.videoExists ? ` | 🎬 Video: ${formatBytes(stats.videoSize)}` : '');
+  }
+  const dl = document.getElementById('tl-dl-' + id);
+  if (dl && stats.videoExists) {
+    const sep = urlToken ? '?token=' + encodeURIComponent(urlToken) : '';
+    dl.href = BASE + '/api/nodes/' + id + '/timelapse/video' + sep;
+    dl.style.display = '';
+  }
+}
+
+async function generateTimelapse(id) {
+  const btn = event.target;
+  btn.textContent = '⏳ Generating...';
+  btn.disabled = true;
+  await api('/api/nodes/' + id + '/timelapse/generate', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({})
+  });
+  // Poll for completion
+  const check = setInterval(async () => {
+    const stats = await api('/api/nodes/' + id + '/timelapse/stats');
+    if (stats && stats.videoExists) {
+      clearInterval(check);
+      btn.textContent = '🎬 Generate Video';
+      btn.disabled = false;
+      loadTimelapseStats(id);
+    }
+  }, 3000);
+  // Timeout after 5 min
+  setTimeout(() => { clearInterval(check); btn.textContent = '🎬 Generate Video'; btn.disabled = false; }, 300000);
 }
 
 // Init is called from PIN gate above
