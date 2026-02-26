@@ -8,6 +8,7 @@ import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import sharp from 'sharp';
 import { execFile, spawn } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -56,6 +57,44 @@ async function sendTelegramAlert(alert) {
     });
     console.log(`[📱] Telegram text alert sent for ${alert.nodeName}`);
   }
+}
+
+// ---------- Auth ----------
+const PHONE_HOME_TOKEN = process.env.PHONE_HOME_TOKEN || '';
+const PHONE_HOME_ADMIN_PIN = process.env.PHONE_HOME_ADMIN_PIN || '';
+
+if (!PHONE_HOME_TOKEN) console.log('⚠️  No PHONE_HOME_TOKEN set — API/WS auth disabled (open access)');
+if (!PHONE_HOME_ADMIN_PIN) console.log('⚠️  No PHONE_HOME_ADMIN_PIN set — admin PIN disabled');
+
+function hashPin(pin) {
+  return crypto.createHash('sha256').update(pin).digest('hex');
+}
+
+const ADMIN_COOKIE_HASH = PHONE_HOME_ADMIN_PIN ? hashPin(PHONE_HOME_ADMIN_PIN) : '';
+
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+  cookieHeader.split(';').forEach(c => {
+    const [k, ...v] = c.trim().split('=');
+    if (k) cookies[k.trim()] = v.join('=').trim();
+  });
+  return cookies;
+}
+
+function checkToken(req) {
+  if (!PHONE_HOME_TOKEN) return true;
+  const q = new URL(req.url, 'http://localhost').searchParams.get('token');
+  if (q === PHONE_HOME_TOKEN) return true;
+  const auth = req.headers.authorization || '';
+  if (auth === `Bearer ${PHONE_HOME_TOKEN}`) return true;
+  return false;
+}
+
+function checkAdminCookie(req) {
+  if (!PHONE_HOME_ADMIN_PIN) return true;
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies.ph_admin === ADMIN_COOKIE_HASH;
 }
 
 // ---------- Config ----------
@@ -206,6 +245,48 @@ app.use(express.static(path.join(PROJECT_ROOT, 'client')));
 // Serve admin dashboard
 app.use('/admin', express.static(path.join(PROJECT_ROOT, 'admin')));
 
+// ---------- Auth routes & middleware ----------
+
+// Admin PIN login
+app.post('/api/admin/login', express.json(), (req, res) => {
+  if (!PHONE_HOME_ADMIN_PIN) return res.json({ ok: true }); // no PIN configured
+  if (req.body.pin === PHONE_HOME_ADMIN_PIN) {
+    res.cookie('ph_admin', ADMIN_COOKIE_HASH, {
+      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: req.secure,
+    });
+    return res.json({ ok: true });
+  }
+  res.status(401).json({ error: 'Wrong PIN' });
+});
+
+// Token auth for all /api/* routes (except admin/login)
+app.use('/api', (req, res, next) => {
+  if (req.path === '/admin/login') return next();
+  if (!checkToken(req)) return res.status(401).json({ error: 'Invalid or missing token' });
+  next();
+});
+
+// Admin-only routes (require admin cookie)
+const ADMIN_ROUTES = [
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/snap$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/listen$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/motion$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/quality$/ },
+  { method: 'POST', pattern: /^\/api\/nodes\/[^/]+\/threshold$/ },
+  { method: 'DELETE', pattern: /^\/api\/alerts$/ },
+];
+
+app.use('/api', (req, res, next) => {
+  const needsAdmin = ADMIN_ROUTES.some(r => r.method === req.method && r.pattern.test(req.originalUrl));
+  if (needsAdmin && !checkAdminCookie(req)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+});
+
 // Serve CA cert for easy install on iPhones
 app.get('/cert', (_req, res) => {
   const certPath = path.join(__dirname, 'certs', 'cert.der');
@@ -266,13 +347,13 @@ app.post('/api/poll/:id/snap', (req, res) => {
   // Expect raw JPEG body
   const chunks = [];
   req.on('data', chunk => chunks.push(chunk));
-  req.on('end', () => {
+  req.on('end', async () => {
     const buf = Buffer.concat(chunks);
     node.bytesIn += buf.length;
     const nodeDir = path.join(SNAPSHOT_DIR, req.params.id);
     fs.mkdirSync(nodeDir, { recursive: true });
     const snapPath = path.join(nodeDir, 'latest.jpg');
-    fs.writeFileSync(snapPath, buf);
+    await fs.promises.writeFile(snapPath, buf);
     // Also handle motion detection if streaming
     if (node.motionEnabled) {
       handleBinaryMessage(req.params.id, buf);
@@ -280,18 +361,6 @@ app.post('/api/poll/:id/snap', (req, res) => {
     res.json({ ok: true });
   });
 });
-
-// Override sendCommand to support polling nodes
-const _origSendCommand = function(node, type, payload) {
-  if (node.ws && node.ws.readyState === 1) {
-    const msg = JSON.stringify({ type, ...payload });
-    node.bytesOut += Buffer.byteLength(msg);
-    node.ws.send(msg);
-  } else if (node.polling) {
-    if (!node.pendingCommands) node.pendingCommands = [];
-    node.pendingCommands.push({ type, ...payload });
-  }
-};
 
 // --- REST API for Reef ---
 
@@ -376,39 +445,51 @@ app.delete('/api/alerts', (_req, res) => {
   res.json({ cleared: true });
 });
 
-// Get system stats
-app.get('/api/stats', (_req, res) => {
+// --- Cached stats (updated every 60s) ---
+let cachedDiskUsage = 0;
+let cachedAlertCountToday = 0;
+
+function computeDirSize(dir) {
+  if (!fs.existsSync(dir)) return 0;
+  let size = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, entry.name);
+    if (entry.isDirectory()) size += computeDirSize(p);
+    else try { size += fs.statSync(p).size; } catch {}
+  }
+  return size;
+}
+
+function refreshCachedStats() {
+  const dataDir = path.join(PROJECT_ROOT, 'data');
+  cachedDiskUsage = computeDirSize(dataDir);
+
   const alertDir = path.join(PROJECT_ROOT, 'data', 'alerts');
-  let alertCount = 0;
   if (fs.existsSync(alertDir)) {
     const today = new Date().toISOString().slice(0, 10);
-    alertCount = fs.readdirSync(alertDir).filter(f => {
-      try {
-        const alert = JSON.parse(fs.readFileSync(path.join(alertDir, f), 'utf-8'));
-        return alert.timestamp && alert.timestamp.startsWith(today);
-      } catch { return false; }
+    // Count by filename prefix (timestamps) to avoid parsing every JSON
+    cachedAlertCountToday = fs.readdirSync(alertDir).filter(f => {
+      // Filenames are like `1740000000000.json` or `tamper-1740000000000.json`
+      const match = f.match(/(\d{13})/);
+      if (match) {
+        return new Date(parseInt(match[1])).toISOString().startsWith(today);
+      }
+      return false;
     }).length;
+  } else {
+    cachedAlertCountToday = 0;
   }
+}
 
-  // Disk usage for data dir
-  let diskUsage = 0;
-  const dataDir = path.join(PROJECT_ROOT, 'data');
-  function dirSize(dir) {
-    if (!fs.existsSync(dir)) return 0;
-    let size = 0;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, entry.name);
-      if (entry.isDirectory()) size += dirSize(p);
-      else try { size += fs.statSync(p).size; } catch {}
-    }
-    return size;
-  }
-  diskUsage = dirSize(dataDir);
+refreshCachedStats();
+const statsInterval = setInterval(refreshCachedStats, 60000);
 
+// Get system stats
+app.get('/api/stats', (_req, res) => {
   res.json({
     nodeCount: nodes.size,
-    alertCount,
-    diskUsage,
+    alertCount: cachedAlertCountToday,
+    diskUsage: cachedDiskUsage,
     uptime: process.uptime(),
   });
 });
@@ -427,14 +508,16 @@ app.post('/api/nodes/:id/threshold', (req, res) => {
 
 // Serve clip video files
 app.get('/api/clips/:nodeId/:filename', (req, res) => {
-  const clipPath = path.join(CLIP_DIR, req.params.nodeId, req.params.filename);
+  const clipPath = path.resolve(CLIP_DIR, req.params.nodeId, req.params.filename);
+  if (!clipPath.startsWith(path.resolve(CLIP_DIR))) return res.status(403).end();
   if (!fs.existsSync(clipPath)) return res.status(404).json({ error: 'Clip not found' });
   res.sendFile(clipPath);
 });
 
 // Serve alert thumbnails
 app.get('/api/thumbs/:nodeId/:filename', (req, res) => {
-  const thumbPath = path.join(CLIP_DIR, req.params.nodeId, req.params.filename);
+  const thumbPath = path.resolve(CLIP_DIR, req.params.nodeId, req.params.filename);
+  if (!thumbPath.startsWith(path.resolve(CLIP_DIR))) return res.status(403).end();
   if (!fs.existsSync(thumbPath)) return res.status(404).json({ error: 'Thumbnail not found' });
   res.sendFile(thumbPath);
 });
@@ -486,8 +569,15 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 function handleWSConnection(ws, req) {
-  // Check if this is an admin client
   const url = new URL(req.url, 'http://localhost');
+
+  // WebSocket auth: require token in query param
+  if (PHONE_HOME_TOKEN && url.searchParams.get('token') !== PHONE_HOME_TOKEN) {
+    ws.close(4001, 'Unauthorized');
+    return;
+  }
+
+  // Check if this is an admin client
   if (url.searchParams.get('role') === 'admin') {
     adminClients.add(ws);
     ws.send(JSON.stringify({ type: 'admin-welcome' }));
@@ -543,6 +633,8 @@ function handleWSConnection(ws, req) {
     broadcastToAdmins({ type: 'node-disconnected', id, name: node.name });
     nodes.delete(id);
     prevFrames.delete(id);
+    bwHistory.delete(id);
+    clipState.delete(id);
   });
 
   ws.on('error', (err) => {
@@ -601,7 +693,7 @@ function handleJsonMessage(nodeId, msg) {
         location: node.location || null,
         timestamp: new Date().toISOString(),
       };
-      fs.writeFileSync(path.join(alertDir, `tamper-${now}.json`), JSON.stringify(alert));
+      fs.promises.writeFile(path.join(alertDir, `tamper-${now}.json`), JSON.stringify(alert)).catch(() => {});
       broadcastToAdmins({ type: 'alert', alert });
       break;
     }
@@ -666,7 +758,7 @@ async function saveSnapshot(nodeId, buffer, requestId) {
 
   const filename = `${Date.now()}.jpg`;
   const filepath = path.join(nodeDir, filename);
-  fs.writeFileSync(filepath, buffer);
+  await fs.promises.writeFile(filepath, buffer);
 
   console.log(`[📸] Snapshot saved: ${filepath} (${buffer.length} bytes)`);
   resolvePending(requestId, {
@@ -683,7 +775,7 @@ async function saveAudio(nodeId, buffer, requestId) {
 
   const filename = `${Date.now()}.webm`;
   const filepath = path.join(nodeDir, filename);
-  fs.writeFileSync(filepath, buffer);
+  await fs.promises.writeFile(filepath, buffer);
 
   console.log(`[🎤] Audio saved: ${filepath} (${buffer.length} bytes)`);
   resolvePending(requestId, {
@@ -708,7 +800,7 @@ async function checkMotion(nodeId, jpegBuffer) {
     // If currently recording a clip, just collect frames
     const clip = clipState.get(nodeId);
     if (clip && clip.recording) {
-      clip.frames.push({ buffer: jpegBuffer, ts: Date.now() });
+      if (clip.frames.length < 20) clip.frames.push({ buffer: jpegBuffer, ts: Date.now() });
       // Track sharpest frame (Laplacian variance approximation via sharp)
       try {
         const stats = await sharp(jpegBuffer).resize(160, 120).greyscale().stats();
@@ -794,7 +886,7 @@ async function finalizeClip(nodeId) {
 
   for (let i = 0; i < clip.frames.length; i++) {
     const padded = String(i).padStart(5, '0');
-    fs.writeFileSync(path.join(tmpDir, `frame-${padded}.jpg`), clip.frames[i].buffer);
+    await fs.promises.writeFile(path.join(tmpDir, `frame-${padded}.jpg`), clip.frames[i].buffer);
   }
 
   // Calculate fps from actual frame timing
@@ -807,7 +899,7 @@ async function finalizeClip(nodeId) {
   // Save best frame as thumbnail
   const thumbPath = path.join(nodeClipDir, `motion-${now}-thumb.jpg`);
   if (clip.bestFrame?.buffer) {
-    fs.writeFileSync(thumbPath, clip.bestFrame.buffer);
+    await fs.promises.writeFile(thumbPath, clip.bestFrame.buffer);
   }
 
   // Stitch frames into MP4 with ffmpeg
@@ -896,7 +988,7 @@ async function finalizeClip(nodeId) {
     location: node?.location || null,
     timestamp: new Date().toISOString(),
   };
-  fs.writeFileSync(path.join(alertDir, `${now}.json`), JSON.stringify(alert));
+  await fs.promises.writeFile(path.join(alertDir, `${now}.json`), JSON.stringify(alert));
   broadcastToAdmins({ type: 'alert', alert });
 
   // --- Telegram alert (only when person detected) ---
@@ -944,13 +1036,15 @@ function resolvePending(requestId, result, error) {
 // ---------- Start ----------
 // HTTPS on main port (camera/mic require secure context)
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '3902', 10); // internal HTTP for API calls
+let httpsServer = null;
+let wssSecure = null;
 try {
   const sslOpts = {
     key: fs.readFileSync(path.join(__dirname, 'certs', 'key.pem')),
     cert: fs.readFileSync(path.join(__dirname, 'certs', 'cert.pem')),
   };
-  const httpsServer = createHttpsServer(sslOpts, app);
-  const wssSecure = new WebSocketServer({ server: httpsServer });
+  httpsServer = createHttpsServer(sslOpts, app);
+  wssSecure = new WebSocketServer({ server: httpsServer });
   wssSecure.on('connection', handleWSConnection);
   httpsServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🔒 Phone Home hub (HTTPS) listening on port ${PORT}`);
@@ -965,3 +1059,33 @@ server.listen(HTTP_PORT, '127.0.0.1', () => {
   console.log(`📡 Phone Home hub (HTTP) listening on port ${HTTP_PORT}`);
   console.log(`   API:        http://localhost:${HTTP_PORT}/api/nodes`);
 });
+
+// ---------- Graceful Shutdown ----------
+function shutdown(signal) {
+  console.log(`\n[🛑] ${signal} received — shutting down...`);
+
+  // Close all WebSocket connections
+  for (const ws of adminClients) ws.close(1001, 'Server shutting down');
+  for (const [, node] of nodes) {
+    if (node.ws) node.ws.close(1001, 'Server shutting down');
+  }
+
+  // Close WS servers
+  wss.close();
+  if (wssSecure) wssSecure.close();
+
+  // Kill YOLO process
+  if (yoloProc) { yoloProc.kill(); yoloProc = null; }
+
+  // Clear intervals
+  clearInterval(statsInterval);
+
+  // Close HTTP servers
+  server.close();
+  if (httpsServer) httpsServer.close();
+
+  setTimeout(() => process.exit(0), 2000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

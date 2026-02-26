@@ -163,6 +163,18 @@ h1 {
 (function() {
   "use strict";
 
+  // ---- Token from URL ----
+  var urlParams = {};
+  try {
+    var search = location.search.substring(1);
+    var parts = search.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split('=');
+      if (kv[0]) urlParams[kv[0]] = decodeURIComponent(kv[1] || '');
+    }
+  } catch(e) {}
+  var urlToken = urlParams.token || '';
+
   // ---- Compatibility layer for iOS 10+ ----
   // Use var throughout for iOS 10 compat
   var nodeName = localStorage.getItem('phoneHomeName');
@@ -323,7 +335,7 @@ h1 {
     setStatus('connecting', 'Connecting...');
 
     var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var url = protocol + '//' + location.host;
+    var url = protocol + '//' + location.host + (urlToken ? '/?token=' + encodeURIComponent(urlToken) : '');
 
     try {
       ws = new WebSocket(url);
@@ -416,7 +428,9 @@ h1 {
       opts.body = JSON.stringify(opts.jsonBody);
       delete opts.jsonBody;
     }
-    return fetch(location.origin + url, opts);
+    var sep = url.indexOf('?') >= 0 ? '&' : '?';
+    var fullUrl = location.origin + url + (urlToken ? sep + 'token=' + encodeURIComponent(urlToken) : '');
+    return fetch(fullUrl, opts);
   }
 
   function startPolling() {
@@ -637,7 +651,7 @@ h1 {
       // Send via fetch POST
       if (canvas.toBlob) {
         canvas.toBlob(function(blob) {
-          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : ''), {
             method: 'POST',
             headers: { 'Content-Type': 'image/jpeg' },
             body: blob
@@ -648,7 +662,7 @@ h1 {
         var binary = atob(dataUrl.split(',')[1]);
         var arr = new Uint8Array(binary.length);
         for (var i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
-        fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+        fetch(location.origin + '/api/poll/' + pollNodeId + '/snap' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : ''), {
           method: 'POST',
           headers: { 'Content-Type': 'image/jpeg' },
           body: arr
@@ -771,7 +785,7 @@ h1 {
         // Use fetch
         if (canvas.toBlob) {
           canvas.toBlob(function(blob) {
-            fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+            fetch(location.origin + '/api/poll/' + pollNodeId + '/snap' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : ''), {
               method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob
             }).catch(function() {});
           }, 'image/jpeg', qSettings.streamQ);
@@ -780,7 +794,7 @@ h1 {
           var b = atob(du.split(',')[1]);
           var a = new Uint8Array(b.length);
           for (var j = 0; j < b.length; j++) a[j] = b.charCodeAt(j);
-          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap', {
+          fetch(location.origin + '/api/poll/' + pollNodeId + '/snap' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : ''), {
             method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: a
           }).catch(function() {});
         }

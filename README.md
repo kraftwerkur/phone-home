@@ -78,12 +78,12 @@ cd hub && npm start
 Then on each iPhone:
 1. Open `https://<hub-ip>:3900/cert` in Safari to install the self-signed CA cert
 2. Go to **Settings → General → About → Certificate Trust Settings** and enable trust
-3. Open `https://<hub-ip>:3900` in Safari
+3. Open `https://<hub-ip>:3900` in Safari (or `https://<hub-ip>:3900?token=xxx` if you set a token)
 4. Give the node a name and grant camera permissions
 
 ## Configuration
 
-All configuration is via environment variables (see `.env.example`):
+All configuration is via environment variables (see `.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -92,6 +92,31 @@ All configuration is via environment variables (see `.env.example`):
 | `TELEGRAM_BOT_TOKEN` | *(empty)* | Telegram bot token (optional) |
 | `TELEGRAM_CHAT_ID` | *(empty)* | Telegram chat ID for alerts (optional) |
 | `PYTHON_BIN` | `./venv/bin/python` | Path to Python binary with ultralytics |
+| `PHONE_HOME_TOKEN` | *(empty)* | API token for all connections (see Auth below) |
+| `PHONE_HOME_ADMIN_PIN` | *(empty)* | Admin PIN for dashboard (see Auth below) |
+
+## Authentication
+
+Phone Home supports two-tier authentication, both optional (backward compatible).
+
+### Tier 1: API Token
+
+Set `PHONE_HOME_TOKEN` in `.env` to require a token on all API routes and WebSocket connections.
+
+- **Phone nodes:** Open `https://<hub-ip>:3900?token=YOUR_TOKEN` — the token is passed automatically on WebSocket and polling requests
+- **Admin dashboard:** Open `https://<hub-ip>:3900/admin?token=YOUR_TOKEN`
+- **API calls:** Pass as `?token=xxx` query param or `Authorization: Bearer xxx` header
+
+If not set, everything works without auth (same as before).
+
+### Tier 2: Admin PIN
+
+Set `PHONE_HOME_ADMIN_PIN` in `.env` to require a PIN for admin actions.
+
+- When you open `/admin`, a PIN entry form appears
+- On correct PIN, a cookie (`ph_admin`) is set for 30 days — no re-entry needed
+- **Admin-protected actions:** snap, listen, motion toggle, quality/threshold changes, alert deletion
+- **Read-only routes** (view alerts, clips, stats, node list) only need the base token
 
 ## API Reference
 

@@ -400,7 +400,75 @@ body {
   </div>
 </div>
 
+<div id="pinOverlay" style="display:none;position:fixed;inset:0;z-index:9999;background:#0a0a0a;display:flex;align-items:center;justify-content:center;flex-direction:column;">
+  <div style="font-family:monospace;color:#0f0;font-size:14px;margin-bottom:16px;">Phone Home — Admin</div>
+  <input id="pinInput" type="password" placeholder="Enter PIN" maxlength="20"
+    style="background:#111;border:1px solid #333;color:#0f0;font-family:monospace;font-size:18px;padding:12px 20px;text-align:center;border-radius:4px;outline:none;width:200px;" />
+  <div id="pinError" style="color:#f44;font-size:12px;margin-top:8px;font-family:monospace;"></div>
+</div>
+
 <script>
+// --- Token from URL ---
+const urlToken = new URLSearchParams(location.search).get('token') || '';
+function tokenParam() { return urlToken ? 'token=' + encodeURIComponent(urlToken) : ''; }
+
+// --- PIN gate ---
+(async function checkPin() {
+  // Test if admin access works by hitting a protected endpoint
+  const testUrl = location.origin + '/api/stats' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : '');
+  try {
+    const r = await fetch(testUrl);
+    if (r.status === 401) {
+      // Need token — but that's a URL config issue, not PIN
+      document.getElementById('pinOverlay').style.display = 'flex';
+      document.getElementById('pinError').textContent = 'Invalid token';
+      return;
+    }
+  } catch {}
+
+  // Check if admin PIN is required (try an admin-only action)
+  const snapTestUrl = location.origin + '/api/nodes/test/snap' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : '');
+  try {
+    const r = await fetch(snapTestUrl, { method: 'POST' });
+    if (r.status === 403) {
+      // Admin cookie missing — show PIN
+      document.getElementById('pinOverlay').style.display = 'flex';
+      document.getElementById('pinInput').focus();
+      document.getElementById('pinInput').addEventListener('keydown', async (e) => {
+        if (e.key !== 'Enter') return;
+        const pin = document.getElementById('pinInput').value;
+        const loginUrl = location.origin + '/api/admin/login' + (urlToken ? '?token=' + encodeURIComponent(urlToken) : '');
+        const lr = await fetch(loginUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin }),
+        });
+        if (lr.ok) {
+          document.getElementById('pinOverlay').style.display = 'none';
+          initAdmin();
+        } else {
+          document.getElementById('pinError').textContent = 'Wrong PIN';
+          document.getElementById('pinInput').value = '';
+        }
+      });
+      return;
+    }
+  } catch {}
+
+  // No PIN needed
+  document.getElementById('pinOverlay').style.display = 'none';
+  initAdmin();
+})();
+
+function initAdmin() {
+  connectWS();
+  refreshNodes();
+  refreshAlerts();
+  refreshStats();
+  setInterval(refreshNodes, 10000);
+  setInterval(refreshStats, 30000);
+}
+
 // --- State ---
 let nodesData = [];
 let alertsData = [];
@@ -423,7 +491,8 @@ document.querySelectorAll('.tab').forEach(tab => {
 // --- WebSocket ---
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(proto + '://' + location.host + '/?role=admin');
+  const wsParams = 'role=admin' + (urlToken ? '&token=' + encodeURIComponent(urlToken) : '');
+  ws = new WebSocket(proto + '://' + location.host + '/?' + wsParams);
 
   ws.onopen = () => {
     document.getElementById('wsDot').classList.add('connected');
@@ -453,7 +522,9 @@ function connectWS() {
 // --- API ---
 async function api(url, opts) {
   try {
-    const res = await fetch(BASE + url, opts);
+    const sep = url.includes('?') ? '&' : '?';
+    const fullUrl = BASE + url + (urlToken ? sep + 'token=' + encodeURIComponent(urlToken) : '');
+    const res = await fetch(fullUrl, opts);
     return await res.json();
   } catch { return null; }
 }
@@ -502,13 +573,6 @@ function formatUptime(s) {
   if (s < 3600) return Math.floor(s/60) + 'm';
   if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
   return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
-}
-
-function formatBytes(b) {
-  if (b < 1024) return b + 'B';
-  if (b < 1048576) return (b / 1024).toFixed(1) + 'KB';
-  if (b < 1073741824) return (b / 1048576).toFixed(1) + 'MB';
-  return (b / 1073741824).toFixed(1) + 'GB';
 }
 
 function timeAgo(ts) {
@@ -599,28 +663,6 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
-}
-
-function guessModel(di) {
-  if (!di) return 'Unknown';
-  const k = di.screenW + 'x' + di.screenH + '@' + di.pixelRatio;
-  const map = {
-    '320x480@2': 'iPhone 4s',
-    '320x568@2': 'iPhone 5s',
-    '375x667@2': 'iPhone 8',
-    '414x736@3': 'iPhone 8+',
-    '375x812@3': 'iPhone X',
-    '414x896@2': 'iPhone XR',
-    '414x896@3': 'iPhone XS Max',
-    '375x812@2': 'iPhone 12 mini',
-    '390x844@3': 'iPhone 13',
-    '428x926@3': 'iPhone 13 Pro Max',
-    '393x852@3': 'iPhone 15',
-    '430x932@3': 'iPhone 15 Pro Max',
-    '402x874@3': 'iPhone 16 Pro',
-    '440x956@3': 'iPhone 16 Pro Max',
-  };
-  return map[k] || ('iPhone ' + di.screenW + '×' + di.screenH + '@' + di.pixelRatio + 'x');
 }
 
 // --- Node Actions ---
@@ -927,16 +969,7 @@ function updateMapMarkers() {
   if (bounds.length > 0) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
 }
 
-// --- Init ---
-connectWS();
-refreshNodes();
-refreshAlerts();
-refreshStats();
-
-// Poll every 15s
-setInterval(() => { refreshNodes(); refreshStats(); }, 15000);
-// Alerts every 30s
-setInterval(refreshAlerts, 30000);
+// Init is called from PIN gate above
 </script>
 </body>
 </html>
