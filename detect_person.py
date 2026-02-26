@@ -30,9 +30,36 @@ def detect(image_path: str) -> dict:
     
     return {"persons": persons, "count": len(persons)}
 
+def run_server():
+    """Server mode: load model once, read image paths from stdin, write JSON per line to stdout."""
+    from ultralytics import YOLO
+    model = YOLO("yolov8n.pt")
+    print("READY", flush=True)
+    for line in sys.stdin:
+        image_path = line.strip()
+        if not image_path:
+            continue
+        try:
+            results = model(image_path, verbose=False, conf=0.35)
+            persons = []
+            for r in results:
+                for box in r.boxes:
+                    if int(box.cls[0]) == 0:
+                        conf = float(box.conf[0])
+                        bbox = box.xyxy[0].tolist()
+                        persons.append({"confidence": round(conf, 3), "bbox": [round(x, 1) for x in bbox]})
+            print(json.dumps({"persons": persons, "count": len(persons)}), flush=True)
+        except Exception as e:
+            print(json.dumps({"persons": [], "count": 0, "error": str(e)}), flush=True)
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--server":
+        run_server()
+        sys.exit(0)
+
     if len(sys.argv) < 2:
-        print("Usage: detect_person.py <image_path>", file=sys.stderr)
+        print("Usage: detect_person.py <image_path> | --server", file=sys.stderr)
         sys.exit(2)
     
     img = sys.argv[1]

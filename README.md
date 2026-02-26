@@ -20,30 +20,24 @@ Phone Home is a self-hosted surveillance system that uses old iPhones as camera 
 
 ## Architecture
 
-```mermaid
-graph LR
-    subgraph Phones["📱 Camera Nodes"]
-        A["iPhone #1<br/>(Safari)"]
-        B["iPhone #2<br/>(Safari)"]
-    end
-
-    subgraph Hub["🖥️ Hub Server (Express)"]
-        C["WSS :3900<br/>HTTP :3902"]
-    end
-
-    A -- "WSS / Poll" --> C
-    B -- "WSS / Poll" --> C
-
-    subgraph Pipeline["🔍 Detection Pipeline"]
-        D["Motion Detection<br/><i>sharp pixel diff</i>"]
-        E["ffmpeg<br/><i>5s clip</i>"]
-        F["YOLOv8 Nano<br/><i>person?</i>"]
-        G["LLaVA (Ollama)<br/><i>describe scene</i>"]
-    end
-
-    C --> D --> E --> F --> G
-
-    G --> H["📱 Telegram Alert<br/>Photo + Caption"]
+```
+┌──────────────┐                    ┌──────────────┐
+│  iPhone #1   │◄── WSS / Poll ───►│              │
+│  (Safari)    │                    │   Hub Server │
+├──────────────┤                    │   (Express)  │
+│  iPhone #2   │◄── WSS / Poll ───►│   :3900 HTTPS│
+│  (Safari)    │                    │   :3902 HTTP │
+└──────────────┘                    └──────┬───────┘
+                                           │
+                            ┌──────────────┼──────────────┐
+                            ▼              ▼              ▼
+                     Motion Detection   YOLOv8n      LLaVA (Ollama)
+                     (sharp pixel diff)  (person?)    (describe scene)
+                            │              │              │
+                            └──────────────┼──────────────┘
+                                           ▼
+                                    Telegram Alert
+                                    📱 Photo + Caption
 ```
 
 ### Detection Pipeline
@@ -121,20 +115,9 @@ All endpoints are on the HTTP port (default 3902).
 
 ## Screenshots
 
-### Admin Dashboard
-Real-time node monitoring with bandwidth graphs, per-node controls, motion sensitivity, and system stats.
+<!-- TODO: Add screenshots of the web client, admin dashboard, and Telegram alerts -->
 
-![Admin Dashboard](screenshots/admin-dashboard.png)
-
-### Camera Node (Client)
-The web client served to each iPhone — name the node and connect to start streaming. Install as a PWA for fullscreen, always-on operation.
-
-![Client Connect](screenshots/client-connect.png)
-
-### Camera Node — Connected
-Once connected, the node streams frames to the hub. Shows connection status, battery level, camera feed, and activity log.
-
-![Client Connected](screenshots/client-connected.png)
+*Coming soon*
 
 ## The Polling Fallback Story
 

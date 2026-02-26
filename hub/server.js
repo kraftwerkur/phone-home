@@ -7,7 +7,7 @@ import { createServer as createHttpsServer } from 'https';
 import { WebSocketServer } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import sharp from 'sharp';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -85,6 +85,95 @@ setInterval(() => {
 fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 fs.mkdirSync(CLIP_DIR, { recursive: true });
+
+// ---------- Disk Cleanup (every 6 hours, delete files older than 7 days) ----------
+const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CLEANUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function cleanupOldFiles() {
+  const dirs = [CLIP_DIR, SNAPSHOT_DIR, AUDIO_DIR];
+  const cutoff = Date.now() - CLEANUP_MAX_AGE_MS;
+  let totalDeleted = 0;
+
+  function walkAndClean(dir) {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkAndClean(full);
+        // Remove empty dirs
+        try { if (fs.readdirSync(full).length === 0) fs.rmdirSync(full); } catch (_) {}
+      } else {
+        try {
+          const stat = fs.statSync(full);
+          if (stat.mtimeMs < cutoff) {
+            fs.unlinkSync(full);
+            totalDeleted++;
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  for (const d of dirs) walkAndClean(d);
+  if (totalDeleted > 0) {
+    console.log(`[🧹] Disk cleanup: deleted ${totalDeleted} file(s) older than 7 days`);
+  }
+}
+
+// Run on startup + every 6 hours
+cleanupOldFiles();
+setInterval(cleanupOldFiles, CLEANUP_INTERVAL_MS);
+
+// ---------- YOLO Server Process ----------
+const yoloScript = path.join(PROJECT_ROOT, 'detect_person.py');
+const pythonBin = process.env.PYTHON_BIN || path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
+let yoloProc = null;
+let yoloReady = false;
+let yoloPendingQueue = []; // [{resolve, reject}]
+let yoloBuffer = '';
+
+function startYoloServer() {
+  yoloProc = spawn(pythonBin, [yoloScript, '--server'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  yoloProc.stdout.on('data', (chunk) => {
+    yoloBuffer += chunk.toString();
+    let lines = yoloBuffer.split('\n');
+    yoloBuffer = lines.pop(); // keep incomplete line
+    for (const line of lines) {
+      if (line.trim() === 'READY') { yoloReady = true; console.log('[🔍] YOLO server ready'); continue; }
+      if (!line.trim()) continue;
+      const cb = yoloPendingQueue.shift();
+      if (cb) {
+        try { cb.resolve(JSON.parse(line)); } catch (e) { cb.resolve({ persons: [], count: 0 }); }
+      }
+    }
+  });
+  yoloProc.stderr.on('data', (d) => { /* suppress ultralytics warnings */ });
+  yoloProc.on('exit', (code) => {
+    console.log(`[⚠️] YOLO server exited (code ${code}), restarting...`);
+    yoloReady = false;
+    // Reject pending
+    for (const cb of yoloPendingQueue) cb.reject(new Error('YOLO process exited'));
+    yoloPendingQueue = [];
+    setTimeout(startYoloServer, 2000);
+  });
+}
+
+function yoloDetect(imagePath) {
+  return new Promise((resolve, reject) => {
+    if (!yoloReady || !yoloProc) {
+      // Fallback to one-shot
+      execFile(pythonBin, [yoloScript, imagePath], { timeout: 30000 }, (err, stdout) => {
+        try { resolve(JSON.parse(stdout)); } catch (_) { resolve({ persons: [], count: 0 }); }
+      });
+      return;
+    }
+    yoloPendingQueue.push({ resolve, reject });
+    yoloProc.stdin.write(imagePath + '\n');
+  });
+}
+
+startYoloServer();
 
 // ---------- State ----------
 
@@ -751,19 +840,7 @@ async function finalizeClip(nodeId) {
   let yoloResult = null;
   if (clip.bestFrame?.buffer) {
     try {
-      const yoloScript = path.join(PROJECT_ROOT, 'detect_person.py');
-      const pythonBin = process.env.PYTHON_BIN || path.join(PROJECT_ROOT, 'venv', 'bin', 'python');
-      yoloResult = await new Promise((resolve, reject) => {
-        execFile(pythonBin, [yoloScript, thumbPath], { timeout: 30000 }, (err, stdout, stderr) => {
-          if (err && err.code === 2) { reject(new Error(stderr || 'YOLO error')); return; }
-          try {
-            const data = JSON.parse(stdout);
-            resolve(data);
-          } catch (_) {
-            resolve({ persons: [], count: 0 });
-          }
-        });
-      });
+      yoloResult = await yoloDetect(thumbPath);
       personDetected = yoloResult.count > 0;
       console.log(`[🔍] YOLO: ${personDetected ? `${yoloResult.count} person(s) detected` : 'no person — skipping LLaVA'}`);
     } catch (e) {
@@ -777,6 +854,8 @@ async function finalizeClip(nodeId) {
   if (personDetected && clip.bestFrame?.buffer) {
     try {
       const imgBase64 = clip.bestFrame.buffer.toString('base64');
+      const abortCtl = new AbortController();
+      const llavaTimeout = setTimeout(() => abortCtl.abort(), 120000);
       const ollamaRes = await fetch('http://localhost:11434/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -786,7 +865,9 @@ async function finalizeClip(nodeId) {
           images: [imgBase64],
           stream: false,
         }),
+        signal: abortCtl.signal,
       });
+      clearTimeout(llavaTimeout);
       if (ollamaRes.ok) {
         const ollamaData = await ollamaRes.json();
         description = ollamaData.response?.trim() || null;
